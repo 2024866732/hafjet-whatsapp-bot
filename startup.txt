@@ -1,0 +1,1 @@
+cd /home/hafizi145/.hermes/whatsapp-bot && gunicorn -w 2 -k uvicorn.workers.UvicornWorker webhook_listener:app --bind 0.0.0.0:8000
