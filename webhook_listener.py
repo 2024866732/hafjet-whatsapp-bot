@@ -15,13 +15,15 @@ import json
 import hashlib
 import hmac
 import logging
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocket as StarletteWebSocket
 
 # ── Load Config ─────────────────────────────────────────────────────
 # Load .env file kalau exist (local development)
@@ -39,6 +41,13 @@ WEBHOOK_VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "HAFJET_RAUB_RAK")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hermes_ai import ask_hermes
 from repair_db import check_repair_status, format_job_status
+from db_logger import (
+    init_db, log_inbound, log_outbound,
+    register_ws, unregister_ws,
+    get_recent_messages, get_customer_messages,
+    get_customer_list, get_stats,
+    broadcast_ws,
+)
 
 # ── Logging ─────────────────────────────────────────────────────────
 os.makedirs(os.path.expanduser("~/.hermes/logs"), exist_ok=True)
@@ -128,12 +137,14 @@ async def receive_message(request: Request):
 
 @app.get("/health")
 async def health():
+    stats = await get_stats()
     return {
         "status": "ok",
         "service": "HAFJET WhatsApp Bot v2.0",
         "timestamp": datetime.now(MYT).isoformat(),
         "configured": bool(WHATSAPP_TOKEN and WHATSAPP_PHONE_ID),
-        "features": ["hybrid_ai", "repair_tracking", "static_menu"],
+        "features": ["hybrid_ai", "repair_tracking", "static_menu", "dashboard", "db_logging"],
+        "stats": stats,
     }
 
 
@@ -178,11 +189,87 @@ async def _process_message(msg: dict, value: dict):
 
     log.info(f"💬 User said: '{user_message}'")
 
+    # ── Log inbound message to DB ────────────────────────────────
+    await log_inbound(from_number, user_message, "text", msg_id)
+
     # ── Route & Generate Reply ───────────────────────────────────
+    import time as _time
+    _reply_start = _time.time()
     reply_text = await generate_reply(user_message, sender_name, from_number)
+    _latency_ms = int((_time.time() - _reply_start) * 1000)
 
     if reply_text:
+        _fallback = (reply_text == CANONICAL_FALLBACK)
         await send_whatsapp_message(from_number, reply_text)
+        # ── Log outbound message to DB ────────────────────────────
+        _routing = _detect_routing(user_message)
+        await log_outbound(from_number, reply_text, _routing, _latency_ms, _fallback)
+    else:
+        # No reply sent (e.g., dedup skip) — log as no-reply
+        await log_outbound(from_number, "[no_reply]", "none", _latency_ms, True)
+
+
+def _detect_routing(message: str) -> str:
+    """Detect routing path for logging purposes."""
+    msg_lower = message.lower().strip()
+    if _is_greeting(msg_lower):
+        return "greeting"
+    if msg_lower in {"1", "2", "3", "4", "menu", "main", "balik", "kembali", "/help", "help", "bantu"}:
+        return "static_menu"
+    if _is_job_id(message):
+        return "job_status"
+    return "ai_query"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  DASHBOARD API ENDPOINTS (v2.1 Phase 1)
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/stats")
+async def api_stats():
+    """Dashboard: Get bot statistics."""
+    return await get_stats()
+
+
+@app.get("/api/messages")
+async def api_messages(limit: int = 50):
+    """Dashboard: Get recent messages."""
+    return await get_recent_messages(limit)
+
+
+@app.get("/api/customers")
+async def api_customers():
+    """Dashboard: Get customer list."""
+    return await get_customer_list()
+
+
+@app.get("/api/messages/{phone}")
+async def api_customer_messages(phone: str, limit: int = 50):
+    """Dashboard: Get messages from specific customer."""
+    return await get_customer_messages(phone, limit)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket):
+    """Dashboard WebSocket: real-time message broadcast."""
+    await websocket.accept()
+    register_ws(websocket)
+    try:
+        # Send recent history on connect
+        recent = await get_recent_messages(30)
+        await websocket.send_json({"event": "history", "data": recent})
+        # Keep alive and listen for client messages
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+                if msg == "ping":
+                    await websocket.send_text("pong")
+            except asyncio.TimeoutError:
+                await websocket.send_text("pong")
+    except Exception:
+        pass
+    finally:
+        unregister_ws(websocket)
 
 
 def _extract_message(msg: dict, msg_type: str) -> str:
@@ -463,15 +550,21 @@ async def send_whatsapp_message(to_number: str, message: str):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  RUN
+#  LIFESPAN — Startup & Shutdown
 # ═══════════════════════════════════════════════════════════════════
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database and verify connections at startup."""
+    init_db()
+    log.info("🚀 HAFJET Bot startup complete — DB initialized")
 
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("WEBHOOK_PORT", 8443))
     log.info(f"🚀 Starting HAFJET WhatsApp Bot v2.0 on port {port}")
-    log.info(f"   Features: Hybrid AI + Repair Tracking + Static Menu")
+    log.info(f"   Features: Hybrid AI + Repair Tracking + Static Menu + Dashboard + DB")
 
     uvicorn.run(
         "webhook_listener:app",
