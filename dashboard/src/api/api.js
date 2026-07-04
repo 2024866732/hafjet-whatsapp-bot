@@ -145,9 +145,20 @@ export async function importContacts(csvText) {
 
 // === ANALYTICS ===
 
+function getAuthHeaders() {
+  const token = localStorage.getItem('staff_token');
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  } else {
+    headers['X-API-Key'] = import.meta.env.VITE_API_KEY || '';
+  }
+  return headers;
+}
+
 export async function fetchAnalyticsOverview() {
   const res = await fetch(`${API_BASE}/api/analytics/overview`, {
-    headers: { 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to fetch analytics overview');
   return res.json();
@@ -155,10 +166,51 @@ export async function fetchAnalyticsOverview() {
 
 export async function fetchAnalyticsChart(days = 7) {
   const res = await fetch(`${API_BASE}/api/analytics/chart?days=${encodeURIComponent(days)}`, {
-    headers: { 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to fetch analytics chart');
   return res.json();
+}
+
+export async function fetchAnalyticsTimeseries({ days = 7, start, end } = {}) {
+  let url = `${API_BASE}/api/analytics/timeseries?days=${encodeURIComponent(days)}`;
+  if (start) url += `&start=${encodeURIComponent(start)}`;
+  if (end) url += `&end=${encodeURIComponent(end)}`;
+  const res = await fetch(url, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error('Failed to fetch timeseries');
+  return res.json();
+}
+
+export async function fetchAgents({ staffId, start, end } = {}) {
+  let url = `${API_BASE}/api/analytics/agents`;
+  const params = [];
+  if (staffId) params.push(`staff_id=${encodeURIComponent(staffId)}`);
+  if (start) params.push(`start=${encodeURIComponent(start)}`);
+  if (end) params.push(`end=${encodeURIComponent(end)}`);
+  if (params.length) url += '?' + params.join('&');
+  const res = await fetch(url, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error('Failed to fetch agents');
+  return res.json();
+}
+
+export function getExportCSVUrl({ exportType = 'overview', start, end } = {}) {
+  let url = `${API_BASE}/api/analytics/export.csv?export_type=${encodeURIComponent(exportType)}`;
+  if (start) url += `&start=${encodeURIComponent(start)}`;
+  if (end) url += `&end=${encodeURIComponent(end)}`;
+  return url;
+}
+
+// Helper: trigger CSV download in browser
+export async function downloadAnalyticsCSV({ exportType = 'overview', start, end } = {}) {
+  const url = getExportCSVUrl({ exportType, start, end });
+  const res = await fetch(url, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error('CSV download failed');
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `analytics_${exportType}_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 // === KEYWORDS ===

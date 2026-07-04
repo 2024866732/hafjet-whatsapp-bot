@@ -631,47 +631,61 @@ def import_contacts_csv(csv_text: str) -> dict:
 #  ANALYTICS
 # ═══════════════════════════════════════════════════════════════════
 
-def get_analytics_overview() -> dict:
-    """Get analytics overview for dashboard cards."""
+def get_analytics_overview(start_date: str = None, end_date: str = None) -> dict:
+    """Get analytics overview for dashboard cards.
+    Supports optional date range (YYYY-MM-DD)."""
     conn = _get_db()
     tz = timezone(timedelta(hours=8))
     now_local = datetime.now(tz)
 
-    # Today in local (UTC+8)
     today_str = now_local.strftime("%Y-%m-%d")
-
-    # This month / last month strings for SQLite
     this_month_prefix = now_local.strftime("%Y-%m")
     first_of_this_month = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     first_of_last_month = (first_of_this_month - timedelta(days=1)).replace(day=1)
     last_month_prefix = first_of_last_month.strftime("%Y-%m")
+    seven_days_ago = (now_local - timedelta(days=7)).strftime("%Y-%m-%d")
 
-    # Total conversations — unique customer_phone with at least 1 message
+    # Build date clause for filtering
+    date_where = ""
+    date_params = []
+    if start_date:
+        date_where += " AND timestamp >= ?"
+        date_params.append(start_date)
+    if end_date:
+        date_where += " AND timestamp <= ?"
+        date_params.append(end_date + " 23:59:59")
+
+    # Total conversations — count distinct customer_phone with at least 1 message
     total_conversations = conn.execute(
         "SELECT COUNT(DISTINCT customer_phone) FROM messages"
     ).fetchone()[0] or 0
 
+    # Inbound / Outbound totals
+    inbound_total = conn.execute(
+        f"SELECT COUNT(*) FROM messages WHERE direction='inbound'{date_where}",
+        date_params
+    ).fetchone()[0] or 0
+    outbound_total = conn.execute(
+        f"SELECT COUNT(*) FROM messages WHERE direction='outbound'{date_where}",
+        date_params
+    ).fetchone()[0] or 0
+
     # New last 7 days
-    seven_days_ago = (now_local - timedelta(days=7)).strftime("%Y-%m-%d")
     new_last_7_days = conn.execute(
         "SELECT COUNT(*) FROM customers WHERE first_contact >= ? AND first_contact IS NOT NULL",
         (seven_days_ago,)
     ).fetchone()[0] or 0
 
-    # Messages this month / last month (use UTC timestamps + offset)
-    # SQLite stores timestamps in UTC (from datetime.now(timezone.utc))
-    # We match local day by doing date(timestamp, '+8 hours')
+    # Messages this / last month
     messages_this_month = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE strftime('%Y-%m', timestamp, '+8 hours') = ?",
         (this_month_prefix,)
     ).fetchone()[0] or 0
-
     messages_last_month = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE strftime('%Y-%m', timestamp, '+8 hours') = ?",
         (last_month_prefix,)
     ).fetchone()[0] or 0
 
-    # Percentage change
     if messages_last_month > 0:
         messages_change_pct = round(
             ((messages_this_month - messages_last_month) / messages_last_month) * 100, 1
@@ -681,7 +695,7 @@ def get_analytics_overview() -> dict:
     else:
         messages_change_pct = 0.0
 
-    # AI Reply Rate: outbound non-fallback / total inbound * 100
+    # AI Reply Rate
     total_inbound = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE direction='inbound'"
     ).fetchone()[0] or 0
@@ -690,7 +704,7 @@ def get_analytics_overview() -> dict:
     ).fetchone()[0] or 0
     ai_reply_rate = round((ai_replies / total_inbound) * 100, 1) if total_inbound > 0 else 0.0
 
-    # Today messages (all directions)
+    # Today messages
     today_messages = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE date(timestamp, '+8 hours') = ?",
         (today_str,)
@@ -701,10 +715,64 @@ def get_analytics_overview() -> dict:
         "SELECT COUNT(*) FROM customers WHERE escalated_at IS NOT NULL"
     ).fetchone()[0] or 0
 
+    # NEW: Resolved count
+    resolved_count = conn.execute(
+        "SELECT COUNT(*) FROM customers WHERE resolved_at IS NOT NULL"
+    ).fetchone()[0] or 0
+
+    # NEW: Average response time (seconds) — per-conversation avg of min inbound→outbound gap
+    # First, get the first inbound and first outbound timestamps per customer
+    avg_first_response = 0
+    avg_response_time = 0
+    avg_resolution_time = 0
+
+    # Average first response time: for conversations with at least 1 inbound + 1 outbound
+    rows = conn.execute("""
+        SELECT c.customer_phone,
+               MIN(CASE WHEN c.direction='inbound' THEN c.timestamp END) as first_in,
+               MIN(CASE WHEN c.direction='outbound' THEN c.timestamp END) as first_out
+        FROM messages c
+        GROUP BY c.customer_phone
+        HAVING first_in IS NOT NULL AND first_out IS NOT NULL
+    """).fetchall()
+    if rows:
+        diffs = []
+        for r in rows:
+            try:
+                fi = datetime.fromisoformat(r[1])
+                fo = datetime.fromisoformat(r[2])
+                if fo > fi:
+                    diffs.append((fo - fi).total_seconds())
+            except (ValueError, TypeError):
+                pass
+        if diffs:
+            avg_first_response = round(sum(diffs) / len(diffs))
+
+    # Average resolution time: for customers with resolved_at
+    rows2 = conn.execute("""
+        SELECT first_contact, resolved_at
+        FROM customers
+        WHERE resolved_at IS NOT NULL AND first_contact IS NOT NULL
+    """).fetchall()
+    if rows2:
+        diffs2 = []
+        for r in rows2:
+            try:
+                fc = datetime.fromisoformat(r[0])
+                ra = datetime.fromisoformat(r[1])
+                if ra > fc:
+                    diffs2.append((ra - fc).total_seconds())
+            except (ValueError, TypeError):
+                pass
+        if diffs2:
+            avg_resolution_time = round(sum(diffs2) / len(diffs2))
+
     conn.close()
 
     return {
         "total_conversations": total_conversations,
+        "inbound_total": inbound_total,
+        "outbound_total": outbound_total,
         "new_last_7_days": new_last_7_days,
         "messages_this_month": messages_this_month,
         "messages_last_month": messages_last_month,
@@ -712,6 +780,10 @@ def get_analytics_overview() -> dict:
         "ai_reply_rate": ai_reply_rate,
         "today_messages": today_messages,
         "escalation_count": escalation_count,
+        "resolved_count": resolved_count,
+        "avg_first_response_time_sec": avg_first_response,
+        "avg_response_time_sec": avg_response_time,
+        "avg_resolution_time_sec": avg_resolution_time,
     }
 
 
@@ -746,6 +818,335 @@ def get_analytics_chart(days: int = 7) -> dict:
 
     conn.close()
     return {"labels": labels, "messages_in": messages_in, "messages_out": messages_out}
+
+
+def get_response_time_stats(start_date: str = None, end_date: str = None) -> dict:
+    """Calculate response time statistics.
+    - first_response: avg seconds from first inbound to first outbound per conversation.
+    - avg_response: avg seconds for all inbound→outbound pairs.
+    - resolution: avg seconds from first_contact to resolved_at.
+    """
+    conn = _get_db()
+    tz = timezone(timedelta(hours=8))
+
+    # Build date clause
+    date_where = ""
+    date_params = []
+
+    # Average first response time
+    first_response_avg = 0
+    avg_reply_avg = 0
+    resolution_avg = 0
+
+    rows = conn.execute("""
+        SELECT customer_phone,
+               MIN(CASE WHEN direction='inbound' THEN timestamp END) as first_in,
+               MIN(CASE WHEN direction='outbound' THEN timestamp END) as first_out
+        FROM messages
+        GROUP BY customer_phone
+        HAVING first_in IS NOT NULL AND first_out IS NOT NULL
+    """).fetchall()
+    diffs = []
+    for r in rows:
+        try:
+            fi = datetime.fromisoformat(r[1])
+            fo = datetime.fromisoformat(r[2])
+            if fo > fi:
+                diffs.append((fo - fi).total_seconds())
+        except (ValueError, TypeError):
+            pass
+    if diffs:
+        first_response_avg = round(sum(diffs) / len(diffs))
+
+    # Average inbound→outbound reply time (all pairs within each conversation)
+    # Use a lag window: for each conversation, find inbound-outbound pairs
+    # Simplified: avg of all outbound timestamps minus most recent inbound
+    pairs_diffs = []
+    convs = conn.execute("SELECT DISTINCT customer_phone FROM messages ORDER BY customer_phone").fetchall()
+    for (phone,) in convs:
+        msgs = conn.execute(
+            "SELECT direction, timestamp FROM messages WHERE customer_phone=? ORDER BY timestamp ASC",
+            (phone,)
+        ).fetchall()
+        last_in = None
+        for m in msgs:
+            if m[0] == 'inbound':
+                try:
+                    last_in = datetime.fromisoformat(m[1])
+                except (ValueError, TypeError):
+                    last_in = None
+            elif m[0] == 'outbound' and last_in is not None:
+                try:
+                    out_ts = datetime.fromisoformat(m[1])
+                    diff = (out_ts - last_in).total_seconds()
+                    if diff > 0 and diff < 86400:  # cap at 24h
+                        pairs_diffs.append(diff)
+                except (ValueError, TypeError):
+                    pass
+                last_in = None
+    if pairs_diffs:
+        avg_reply_avg = round(sum(pairs_diffs) / len(pairs_diffs))
+
+    # Average resolution time
+    rows2 = conn.execute("""
+        SELECT first_contact, resolved_at
+        FROM customers
+        WHERE resolved_at IS NOT NULL AND first_contact IS NOT NULL
+    """).fetchall()
+    diffs2 = []
+    for r in rows2:
+        try:
+            fc = datetime.fromisoformat(r[0])
+            ra = datetime.fromisoformat(r[1])
+            if ra > fc:
+                diffs2.append((ra - fc).total_seconds())
+        except (ValueError, TypeError):
+            pass
+    if diffs2:
+        resolution_avg = round(sum(diffs2) / len(diffs2))
+
+    conn.close()
+    return {
+        "avg_first_response_time_sec": first_response_avg,
+        "avg_response_time_sec": avg_reply_avg,
+        "avg_resolution_time_sec": resolution_avg,
+    }
+
+
+def get_agent_performance(staff_id: int = None, start_date: str = None, end_date: str = None) -> list:
+    """Get performance metrics per staff member.
+    Returns list of dicts with: id, name, conversations_handled, avg_response_sec,
+    escalated_count, resolved_count.
+    """
+    conn = _get_db()
+    date_where = ""
+    date_params = []
+    if start_date:
+        date_where += " AND timestamp >= ?"
+        date_params.append(start_date)
+    if end_date:
+        date_where += " AND timestamp <= ?"
+        date_params.append(end_date + " 23:59:59")
+
+    # Get all staff (or a specific one)
+    if staff_id:
+        staff_rows = conn.execute(
+            "SELECT id, name, assigned_phone FROM staff WHERE id=?", (staff_id,)
+        ).fetchall()
+    else:
+        staff_rows = conn.execute(
+            "SELECT id, name, assigned_phone FROM staff ORDER BY name"
+        ).fetchall()
+
+    result = []
+    for sid, sname, assigned_phone in staff_rows:
+        if not assigned_phone:
+            result.append({
+                "id": sid,
+                "name": sname,
+                "conversations_handled": 0,
+                "avg_response_time_sec": 0,
+                "escalated_count": 0,
+                "resolved_count": 0,
+                "messages_sent": 0,
+            })
+            continue
+
+        # Conversations assigned to this staff
+        convs = conn.execute(
+            "SELECT phone FROM customers WHERE assigned_to=?",
+            (str(sid),)
+        ).fetchall()
+        conv_phones = [r[0] for r in convs if r[0]]
+
+        # Count messages sent by this staff (outbound to their assigned customers)
+        if conv_phones:
+            placeholders = ",".join("?" for _ in conv_phones)
+            msgs_sent = conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE direction='outbound' AND customer_phone IN ({placeholders}){date_where}",
+                conv_phones + date_params
+            ).fetchone()[0] or 0
+        else:
+            msgs_sent = 0
+
+        # Count escalated conversations assigned to this staff
+        esc_count = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE assigned_to=? AND escalated_at IS NOT NULL",
+            (str(sid),)
+        ).fetchone()[0] or 0
+
+        # Count resolved conversations assigned to this staff
+        res_count = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE assigned_to=? AND resolved_at IS NOT NULL",
+            (str(sid),)
+        ).fetchone()[0] or 0
+
+        # Avg response time for their conversations
+        avg_resp = 0
+        if conv_phones:
+            inbound_ts = []
+            outbound_ts = []
+            for cp in conv_phones:
+                in_t = conn.execute(
+                    "SELECT MIN(timestamp) FROM messages WHERE customer_phone=? AND direction='inbound'",
+                    (cp,)
+                ).fetchone()[0]
+                out_t = conn.execute(
+                    "SELECT MIN(timestamp) FROM messages WHERE customer_phone=? AND direction='outbound'",
+                    (cp,)
+                ).fetchone()[0]
+                if in_t and out_t:
+                    inbound_ts.append(in_t)
+                    outbound_ts.append(out_t)
+            diffs = []
+            for fi, fo in zip(inbound_ts, outbound_ts):
+                try:
+                    if fo > fi:
+                        diffs.append((datetime.fromisoformat(fo) - datetime.fromisoformat(fi)).total_seconds())
+                except (ValueError, TypeError):
+                    pass
+            if diffs:
+                avg_resp = round(sum(diffs) / len(diffs))
+
+        result.append({
+            "id": sid,
+            "name": sname,
+            "conversations_handled": len(conv_phones),
+            "avg_response_time_sec": avg_resp,
+            "escalated_count": esc_count,
+            "resolved_count": res_count,
+            "messages_sent": msgs_sent,
+        })
+
+    conn.close()
+    return result
+
+
+def get_analytics_timeseries(days: int = 7, start_date: str = None, end_date: str = None) -> dict:
+    """Get daily time-series data: inbound/outbound, escalated/resolved, response time."""
+    conn = _get_db()
+    tz = timezone(timedelta(hours=8))
+    now_local = datetime.now(tz)
+
+    labels = []
+    messages_in = []
+    messages_out = []
+    escalated = []
+    resolved = []
+    response_times = []
+
+    date_range = range(days - 1, -1, -1)
+    if start_date and end_date:
+        # Override range with custom dates
+        try:
+            sd = datetime.strptime(start_date, "%Y-%m-%d")
+            ed = datetime.strptime(end_date, "%Y-%m-%d")
+            day_count = (ed - sd).days + 1
+            labels_ts = [sd + timedelta(days=i) for i in range(day_count)]
+        except ValueError:
+            labels_ts = [now_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    else:
+        labels_ts = [now_local - timedelta(days=i) for i in range(days - 1, -1, -1)]
+
+    for d in labels_ts:
+        date_str = d.strftime("%Y-%m-%d")
+        label = d.strftime("%-d %b") if d.date() != now_local.date() else "Hari ini"
+
+        in_count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE date(timestamp, '+8 hours') = ? AND direction='inbound'",
+            (date_str,)
+        ).fetchone()[0] or 0
+        out_count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE date(timestamp, '+8 hours') = ? AND direction='outbound'",
+            (date_str,)
+        ).fetchone()[0] or 0
+        esc_count = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE date(escalated_at, '+8 hours') = ?",
+            (date_str,)
+        ).fetchone()[0] or 0
+        res_count = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE date(resolved_at, '+8 hours') = ?",
+            (date_str,)
+        ).fetchone()[0] or 0
+
+        # Avg response time for this day (inbound→outbound within same day)
+        day_diffs = []
+        msgs = conn.execute(
+            "SELECT direction, timestamp FROM messages WHERE date(timestamp, '+8 hours') = ? ORDER BY customer_phone, timestamp ASC",
+            (date_str,)
+        ).fetchall()
+        last_in = None
+        for m in msgs:
+            if m[0] == 'inbound':
+                try:
+                    last_in = datetime.fromisoformat(m[1])
+                except (ValueError, TypeError):
+                    last_in = None
+            elif m[0] == 'outbound' and last_in is not None:
+                try:
+                    dt = (datetime.fromisoformat(m[1]) - last_in).total_seconds()
+                    if 0 < dt < 86400:
+                        day_diffs.append(dt)
+                except (ValueError, TypeError):
+                    pass
+                last_in = None
+        avg_rt = round(sum(day_diffs) / len(day_diffs)) if day_diffs else 0
+
+        labels.append(label)
+        messages_in.append(in_count)
+        messages_out.append(out_count)
+        escalated.append(esc_count)
+        resolved.append(res_count)
+        response_times.append(avg_rt)
+
+    conn.close()
+    return {
+        "labels": labels,
+        "messages_in": messages_in,
+        "messages_out": messages_out,
+        "escalated": escalated,
+        "resolved": resolved,
+        "response_times_sec": response_times,
+    }
+
+
+def get_export_csv(export_type: str = "overview", start_date: str = None, end_date: str = None) -> str:
+    """Generate CSV for analytics data."""
+    import io, csv
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    if export_type == "overview":
+        writer.writerow(["Metric", "Value"])
+        overview = get_analytics_overview(start_date, end_date)
+        for key, val in overview.items():
+            writer.writerow([key.replace("_", " ").title(), val])
+
+    elif export_type == "timeseries":
+        writer.writerow(["Date", "Messages In", "Messages Out", "Escalated", "Resolved", "Avg Response (sec)"])
+        ts = get_analytics_timeseries(7, start_date, end_date)
+        for i, label in enumerate(ts["labels"]):
+            writer.writerow([
+                label,
+                ts["messages_in"][i],
+                ts["messages_out"][i],
+                ts["escalated"][i],
+                ts["resolved"][i],
+                ts["response_times_sec"][i],
+            ])
+
+    elif export_type == "agents":
+        writer.writerow(["Staff ID", "Name", "Conversations Handled", "Avg Response (sec)", "Escalated", "Resolved", "Messages Sent"])
+        agents = get_agent_performance(None, start_date, end_date)
+        for a in agents:
+            writer.writerow([
+                a["id"], a["name"], a["conversations_handled"],
+                a["avg_response_time_sec"], a["escalated_count"],
+                a["resolved_count"], a["messages_sent"],
+            ])
+
+    return output.getvalue()
 
 
 # ═══════════════════════════════════════════════════════════════════

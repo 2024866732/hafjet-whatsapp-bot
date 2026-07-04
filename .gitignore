@@ -17,5 +17,7 @@ Thumbs.db
 
 # Build
 *.zip
-dist/
 build/
+
+# Dashboard dist — INCLUDED in deployment (served from FastAPI)
+!dashboard/dist/

@@ -56,6 +56,8 @@ from db_logger import (
     create_blast, update_blast_status, get_blast_history, get_all_customer_phones,
     get_contacts, update_contact, export_contacts, import_contacts_csv,
     get_analytics_overview, get_analytics_chart,
+    get_response_time_stats, get_agent_performance,
+    get_analytics_timeseries, get_export_csv,
     get_all_keywords, create_keyword as db_create_keyword, update_keyword as db_update_keyword,
     delete_keyword as db_delete_keyword, toggle_keyword as db_toggle_keyword,
     reorder_keywords as db_reorder_keywords,
@@ -1518,21 +1520,27 @@ async def api_import_contacts(data: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ANALYTICS API
+# ═══════════════════════════════════════════════════════════════════
+#  ANALYTICS API — v2.2.0
 # ═══════════════════════════════════════════════════════════════════
 
-
 @app.get("/api/analytics/overview")
-async def api_analytics_overview():
-    """Analytics overview: totals, AI reply rate, escalation count."""
+async def api_analytics_overview(
+    staff: dict = Depends(get_current_staff),
+    start: str = None,
+    end: str = None
+):
+    """Analytics overview: totals, response times, escalation/resolution."""
     try:
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, get_analytics_overview)
+        data = await loop.run_in_executor(None, get_analytics_overview, start, end)
         return data
     except Exception as e:
         log.error(f"❌ api_analytics_overview failed: {e}", exc_info=True)
         return {
             "total_conversations": 0,
+            "inbound_total": 0,
+            "outbound_total": 0,
             "new_last_7_days": 0,
             "messages_this_month": 0,
             "messages_last_month": 0,
@@ -1540,12 +1548,77 @@ async def api_analytics_overview():
             "ai_reply_rate": 0.0,
             "today_messages": 0,
             "escalation_count": 0,
+            "resolved_count": 0,
+            "avg_first_response_time_sec": 0,
+            "avg_response_time_sec": 0,
+            "avg_resolution_time_sec": 0,
         }
 
 
+@app.get("/api/analytics/timeseries")
+async def api_analytics_timeseries(
+    staff: dict = Depends(get_current_staff),
+    days: int = 7,
+    start: str = None,
+    end: str = None
+):
+    """Time-series chart data: in/out, escalated/resolved, response time per day."""
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, get_analytics_timeseries, days, start, end)
+        return data
+    except Exception as e:
+        log.error(f"❌ api_analytics_timeseries failed: {e}", exc_info=True)
+        return {"labels": [], "messages_in": [], "messages_out": [],
+                "escalated": [], "resolved": [], "response_times_sec": []}
+
+
+@app.get("/api/analytics/agents")
+async def api_analytics_agents(
+    staff: dict = Depends(get_current_staff),
+    staff_id: int = None,
+    start: str = None,
+    end: str = None
+):
+    """Agent performance metrics per staff member."""
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, get_agent_performance, staff_id, start, end)
+        return {"agents": data}
+    except Exception as e:
+        log.error(f"❌ api_analytics_agents failed: {e}", exc_info=True)
+        return {"agents": []}
+
+
+@app.get("/api/analytics/export.csv")
+async def api_analytics_export_csv(
+    staff: dict = Depends(get_current_staff),
+    export_type: str = "overview",
+    start: str = None,
+    end: str = None
+):
+    """Export analytics data as CSV download."""
+    try:
+        loop = asyncio.get_event_loop()
+        csv_data = await loop.run_in_executor(None, get_export_csv, export_type, start, end)
+        from fastapi.responses import StreamingResponse
+        import io
+        return StreamingResponse(
+            io.StringIO(csv_data),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=analytics_{export_type}.csv"}
+        )
+    except Exception as e:
+        log.error(f"❌ api_analytics_export_csv failed: {e}", exc_info=True)
+        return {"error": "CSV export failed"}
+
+
 @app.get("/api/analytics/chart")
-async def api_analytics_chart(days: int = 7):
-    """Time-series chart data: inbound/outbound per day."""
+async def api_analytics_chart(
+    staff: dict = Depends(get_current_staff),
+    days: int = 7
+):
+    """Legacy time-series chart data (backward compat)."""
     try:
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, get_analytics_chart, days)
