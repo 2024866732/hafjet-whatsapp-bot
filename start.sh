@@ -1,5 +1,3 @@
 #!/bin/bash
-# Start HAFJET WhatsApp Bot Webhook Listener
-cd /home/hafizi145/.hermes/whatsapp-bot
-mkdir -p /home/hafizi145/.hermes/logs
-python3 webhook_listener.py
+cd /home/site/wwwroot
+/home/site/wwwroot/antenv/bin/gunicorn -w 2 -k uvicorn.workers.UvicornWorker webhook_listener:app --bind 0.0.0.0:8000 --timeout 120
