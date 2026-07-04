@@ -1,216 +1,217 @@
-"""
-hermes_ai.py — Hermes AI Integration Module (Azure-Safe)
-Menghubungkan WhatsApp chatbot dengan AI provider via HTTP API.
-
-Priority:
-  1. OpenRouter API (Azure & local) — primary AI source
-  2. Hermes CLI (local dev only) — fallback kalau OpenRouter fail
-  3. Default response — final fallback
-"""
-
 import os
-import json
-import logging
-import asyncio
-import httpx
+import requests
+import subprocess
+import traceback
+import time
 from typing import Optional
 
-log = logging.getLogger("hafjet-whatsapp.ai")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free").strip()
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# ── AI Provider Config ──────────────────────────────────────────────
-# OpenRouter — free tier cukup untuk production
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/owl-alpha")
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_TIMEOUT = int(os.getenv("AI_TIMEOUT", "30"))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SYSTEM_PROMPT_PATH = os.path.join(BASE_DIR, "system_prompt.txt")
+BUSINESS_INFO_PATH = os.path.join(BASE_DIR, "business_info.txt")
 
-# Hermes CLI — untuk local development je
-HERMES_CLI = "hermes"
-HERMES_TIMEOUT = 30
-
-# ── SOUL Context untuk AI ──────────────────────────────────────────
-SOUL_CONTEXT = """\
-You are the HAFJET WhatsApp assistant, an automated customer service bot for HAFJET (M) SDN BHD, \
-a mobile phone repair shop in Malaysia. You help customers with:
-
-1. Repair pricing inquiries (iPhone, Android, screen, battery, charging port, water damage, motherboard)
-2. Job status tracking (customers send job numbers like JOB-2026-XXX)
-3. Store location and operating hours
-4. General customer service
-
-Guidelines:
-- Reply in casual Bahasa Malaysia with friendly tone
-- Keep responses concise (WhatsApp style, not too long)
-- Use emojis sparingly but appropriately
-- If you don't know something, direct them to call the shop
-- Operating hours: Mon-Sat 9AM-7PM, Sun 10AM-5PM
-- Shop phone: +60 11-4956 1698
-
-When asked about repair prices, give estimates:
-- iPhone Screen: RM180-350
-- iPhone Battery: RM120-200
-- Android Screen: RM150-400
-- Charging Port: RM80-150
-- Water Damage: RM100-250
-- Motherboard: RM200-500
-
-Always end with a helpful next step or question. \
-Reply in Bahasa Malaysia (casual/informal). Keep it short, 2-4 sentences max.\
+DEFAULT_SYSTEM_PROMPT = """Anda ialah HAFJET AI Assistant.
+Bercakap dalam Bahasa Melayu yang santai, mesra, dan membantu.
+Jangan flirt, jangan janji harga final tanpa semakan, jangan janji kelulusan ansuran, dan jangan reka fakta.
+Jika tak pasti, cadangkan pelanggan sambung dengan staff manusia.
 """
 
+DEFAULT_BUSINESS_INFO = """HAFJET ialah kedai telefon dan repair di Raub, Pahang.
+Waktu operasi:
+- Setiap Hari: 9:00 AM - 9:00 PM
+Kaedah bayaran:
+- Kad Debit
+- Kad Kredit
+- QR Code
+- Shopee SPayLater
+- AEON Easy Payment
+- Boost PayFlex
+Nombor rasmi:
++60 16-980 8736
+Lokasi:
+No. 890 Jalan Lestari 20, Taman Amalina Lestari, 27600 Raub, Pahang
+Google Maps: https://g.co/kgs/95C9TB
+"""
 
-async def ask_hermes(user_message: str, sender_name: str) -> Optional[str]:
-    """
-    Generate AI reply. Tries methods in order:
-    1. OpenRouter HTTP API (works in both Azure and local)
-    2. Hermes CLI (local dev only)
-    3. None (triggers default fallback in caller)
-    """
-    prompt = f"{SOUL_CONTEXT}\n\nCustomer ({sender_name}) said: {user_message}\n\nReply in casual Malay:"
+def safe_read_text(path: str, fallback: str) -> str:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                return content if content else fallback
+    except Exception as e:
+        print(f"[hermes_ai] warning: failed reading {path}: {e}")
+    return fallback
 
-    # ── Method 1: OpenRouter HTTP API (primary — Azure-safe) ──────
-    if OPENROUTER_API_KEY:
-        reply = await _ask_openrouter(prompt)
-        if reply:
-            return reply
-        log.warning("⚠ OpenRouter returned empty, trying fallback")
+SYSTEM_PROMPT = safe_read_text(SYSTEM_PROMPT_PATH, DEFAULT_SYSTEM_PROMPT)
+BUSINESS_INFO = safe_read_text(BUSINESS_INFO_PATH, DEFAULT_BUSINESS_INFO)
+
+SOUL_CONTEXT = f"""
+{SYSTEM_PROMPT}
+
+================ BUSINESS INFO ================
+{BUSINESS_INFO}
+==============================================
+
+PERATURAN TAMBAHAN:
+- Jawapan mesti ringkas, mesra, dan sesuai untuk WhatsApp.
+- Jika pelanggan tanya harga, beri anggaran / rujukan sahaja melainkan ada fakta tepat.
+- Jika pelanggan tanya stok, kelulusan ansuran, atau harga final repair, jangan confirm jika tidak pasti.
+- Jika pelanggan tanya perkara yang perlukan semakan lanjut, arahkan kepada staff manusia.
+- Jika pelanggan cuba mengorat atau borak luar topik, balas sopan dan redirect semula kepada urusan HAFJET.
+- Jangan sebut promosi tetap kerana tiada promosi tetap buat masa ini melainkan staff telah sahkan.
+"""
+
+def ask_openrouter(user_message: str, wa_name: Optional[str] = None) -> Optional[str]:
+    start_time = time.time()
+    print(f"[hermes_ai] [OPENROUTER] Request started at {start_time}")
+    
+    # Verify configuration
+    if not OPENROUTER_API_KEY:
+        print("[hermes_ai] [OPENROUTER] ERROR: OPENROUTER_API_KEY is empty or not set")
+        return None
+    print(f"[hermes_ai] [OPENROUTER] API key (last 6 chars): ...{OPENROUTER_API_KEY[-6:]}")
+    
+    if not OPENROUTER_MODEL:
+        print("[hermes_ai] [OPENROUTER] ERROR: OPENROUTER_MODEL is empty")
+        return None
+    print(f"[hermes_ai] [OPENROUTER] Model: {OPENROUTER_MODEL}")
+    
+    # Ensure URL ends with /v1/chat/completions (basic check)
+    if not OPENROUTER_URL.endswith("/v1/chat/completions"):
+        print(f"[hermes_ai] [OPENROUTER] WARNING: Base URL might be incorrect. Current: {OPENROUTER_URL}")
     else:
-        log.info("ℹ OPENROUTER_API_KEY not set, skipping OpenRouter")
-
-    # ── Method 2: Hermes CLI (local dev only) ────────────────────
-    reply = await _ask_hermes_cli(prompt)
-    if reply:
-        return reply
-
-    # ── Return None — caller will use default fallback ────────────
-    log.warning("⚠ All AI methods failed, returning None for default fallback")
-    return None
-
-
-async def _ask_openrouter(prompt: str) -> Optional[str]:
-    """Call OpenRouter Chat Completions API."""
-    url = f"{OPENROUTER_BASE_URL}/chat/completions"
+        print(f"[hermes_ai] [OPENROUTER] Base URL: {OPENROUTER_URL}")
+    
+    customer_name_hint = wa_name.strip() if wa_name else "pelanggan"
+    messages = [
+        {"role": "system", "content": SOUL_CONTEXT},
+        {"role": "user", "content": f"Nama pelanggan: {customer_name_hint}\\nMesej pelanggan: {user_message}"}
+    ]
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("APP_REFERER", "https://hafjet.com"),
-        "X-Title": "HAFJET WhatsApp Bot",
+        "Content-Type": "application/json"
     }
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": (
-                "You are HAFJET WhatsApp bot for phone repair shop. "
-                "Reply in casual Bahasa Malaysia ONLY, 2-3 sentences max, under 300 characters. "
-                "Keep it short and direct. No extra commentary."
-            )},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 150,  # ── Batas reply pendek (2-3 sentences)
-        "temperature": 0.3, # ── Lower temp = lebih consistent, tak vary-vary
+        "messages": messages,
+        "temperature": 0.5
     }
-
+    
+    timeout_val = int(os.getenv("OPENROUTER_TIMEOUT", "30"))
+    print(f"[MODEL_DEBUG] model={OPENROUTER_MODEL} base_url={OPENROUTER_URL} timeout={timeout_val}")
+    
     try:
-        # Fail-fast: connect=5s, read=10s — jangan block webhook lama
-        timeout_cfg = httpx.Timeout(
-            connect=5.0,
-            read=10.0,
-            write=5.0,
-            pool=5.0,
-        )
-        async with httpx.AsyncClient(timeout=timeout_cfg) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                reply = data["choices"][0]["message"]["content"].strip()
-                if reply:
-                    log.info(f"🤖 OpenRouter reply: {reply[:100]}...")
-                    return reply
-                else:
-                    log.warning("⚠ OpenRouter returned empty content")
-            elif resp.status_code == 429:
-                log.warning("⚠ OpenRouter rate limited (429) — try again later")
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout_val)
+        print(f"[MODEL_DEBUG] status_code={resp.status_code}")
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"[hermes_ai] [OPENROUTER] Raw response body (first 500 chars): {resp.text[:500]}")
+        print(f"[hermes_ai] [OPENROUTER] Request completed in {duration:.2f} seconds")
+        
+        if resp.status_code < 200 or resp.status_code >= 300:
+            if resp.status_code == 429:
+                print("[hermes_ai] [OPENROUTER] Rate limited (429) — retrying once after 2s sleep")
+                print(f"[hermes_ai] [OPENROUTER] Rate limit message: {resp.text[:300]}")
+                time.sleep(2)
+                resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
+                duration = time.time() - start_time
+                print(f"[hermes_ai] [OPENROUTER] Retry status: {resp.status_code} (total time: {duration:.2f}s)")
+                print(f"[hermes_ai] [OPENROUTER] Retry raw body: {resp.text[:500]}")
+                if resp.status_code >= 200 and resp.status_code < 300:
+                    try:
+                        data = resp.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                        if content:
+                            print(f"[hermes_ai] [OPENROUTER] Retry succeeded! Content: {content[:100]}")
+                            return content
+                    except:
+                        pass
+                print("[hermes_ai] [OPENROUTER] Retry also failed — falling back")
+                return None
             elif resp.status_code == 401:
-                log.error("⚠ OpenRouter auth failed (401) — check API key")
-            elif resp.status_code == 503:
-                log.warning("⚠ OpenRouter service unavailable (503) — try again later")
+                print("[hermes_ai] [OPENROUTER] ERROR: Unauthorized (401) — API key invalid or revoked")
+            elif resp.status_code == 402:
+                print("[hermes_ai] [OPENROUTER] ERROR: Payment required (402) — account needs top-up")
+            elif resp.status_code == 404:
+                print("[hermes_ai] [OPENROUTER] ERROR: Model not found (404) — check model name")
             else:
-                log.error(f"⚠ OpenRouter API error: {resp.status_code} — {resp.text[:200]}")
-    except httpx.TimeoutException:
-        log.error("⏱ OpenRouter API timeout (fail-fast triggered)")
+                print(f"[hermes_ai] [OPENROUTER] ERROR: Bad status code {resp.status_code}")
+            return None
+        
+        try:
+            data = resp.json()
+        except Exception as e:
+            print(f"[hermes_ai] [OPENROUTER] ERROR: Failed to parse JSON: {e}")
+            traceback.print_exc()
+            return None
+        
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if not content:
+            print("[hermes_ai] [OPENROUTER] WARNING: Empty content in response")
+            return None
+        
+        print(f"[hermes_ai] [OPENROUTER] Success: Returning content (first 100 chars): {content[:100]}")
+        print(f"[MODEL_DEBUG] reply={content[:200]}")
+        return content
+        
     except Exception as e:
-        log.error(f"❌ OpenRouter API error: {e}")
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"[hermes_ai] [OPENROUTER] EXCEPTION after {duration:.2f} seconds: {e}")
+        traceback.print_exc()
+        return None
 
-    return None
-
-
-async def _ask_hermes_cli(prompt: str) -> Optional[str]:
-    """Fallback: Call Hermes CLI (local development only)."""
+def ask_hermes_cli(user_message: str) -> Optional[str]:
+    """Fallback to Hermes CLI — only if 'hermes' binary exists."""
+    import shutil
+    if not shutil.which("hermes"):
+        print("[hermes_ai] Hermes CLI not found — skipping fallback")
+        return None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            HERMES_CLI, "ask", "--no-stream", prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = subprocess.run(
+            ["hermes", "ask", user_message],
+            capture_output=True,
+            text=True,
+            timeout=60
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=HERMES_TIMEOUT
-        )
-        if proc.returncode == 0 and stdout.decode().strip():
-            reply = stdout.decode().strip()
-            log.info(f"🤖 Hermes CLI reply: {reply[:100]}...")
-            return reply
-        else:
-            log.warning(f"⚠ Hermes CLI returned code={proc.returncode}")
-    except FileNotFoundError:
-        log.info("ℹ Hermes CLI not found (expected in Azure)")
-    except asyncio.TimeoutError:
-        log.warning("⏱ Hermes CLI timeout")
+        if result.returncode == 0:
+            output = (result.stdout or "").strip()
+            return output or None
+        print(f"[hermes_ai] Hermes CLI failed: {result.stderr}")
+        return None
     except Exception as e:
-        log.error(f"❌ Hermes CLI error: {e}")
+        print(f"[hermes_ai] Hermes CLI exception: {e}")
+        traceback.print_exc()
+        return None
 
-    return None
-
-
-def should_use_ai(message: str) -> bool:
-    """
-    Tentukan sama ada mesej perlu dihantar ke AI atau boleh handle statik.
-    Returns True jika perlu AI, False jika boleh handle statik.
-    """
-    msg_lower = message.lower().strip()
-
-    # ── Static patterns (handle locally, tak perlu AI) ──────────
-    static_triggers = {
-        "1", "2", "3", "4",
-        "1️⃣", "2️⃣", "3️⃣", "4️⃣",
-        "menu", "main", "balik", "kembali",
-        "/help", "help", "bantu",
-        "semak status", "status job",
-        "semak harga",
-        "hubungi", "staff",
-        "lokasi", "waktu operasi",
-    }
-
-    if msg_lower in static_triggers:
-        return False
-
-    if msg_lower.startswith("job-") or msg_lower.startswith("receipt-"):
-        return False
-
-    # Extended greeting detection — sama dengan _is_greeting() di webhook_listener
-    greetings_exact = [
-        "hi", "hello", "hey", "halo", "hai", "helo", "hallo",
-        "selamat pagi", "selamat petang", "selamat malam", "selamat tengahari",
-        "assalamualaikum", "waalaikumsalam", "assalam", "salam",
-        "apa khabar", "apa kabar", "howdy", "yo", "oi",
-    ]
-    greetings_startswith = [
-        "hi ", "hello ", "hey ", "halo ", "hai ", "selamat ",
-        "assalam", "waalaikum", "good morning", "good evening",
-        "apa khabar", "apa kabar",
-    ]
-    if msg_lower in greetings_exact:
-        return False
-    if msg_lower.startswith(tuple(greetings_startswith)):
-        return False
-
-    return True
+def ask_hermes(user_message: str, wa_name: Optional[str] = None) -> Optional[str]:
+    start_time = time.time()
+    print(f"[hermes_ai] [ASK_HERMES] Request started at {start_time}")
+    
+    # Try OpenRouter first
+    reply = ask_openrouter(user_message, wa_name=wa_name)
+    if reply and reply.strip():
+        print(f"[hermes_ai] [ASK_HERMES] OpenRouter succeeded")
+        end_time = time.time()
+        print(f"[hermes_ai] [ASK_HERMES] Total time: {end_time - start_time:.2f} seconds")
+        return reply
+    
+    print(f"[hermes_ai] [ASK_HERMES] OpenRouter returned empty/None, falling back to Hermes CLI")
+    # Fallback to Hermes CLI
+    reply = ask_hermes_cli(user_message)
+    if reply and reply.strip():
+        print(f"[hermes_ai] [ASK_HERMES] Hermes CLI succeeded")
+        end_time = time.time()
+        print(f"[hermes_ai] [ASK_HERMES] Total time: {end_time - start_time:.2f} seconds")
+        return reply
+    
+    print(f"[hermes_ai] [ASK_HERMES] Both OpenRouter and Hermes CLI failed, using fallback message")
+    # Fallback message
+    fallback_msg = "Maaf, sistem sibuk sekejap. Untuk bantuan segera WhatsApp admin:\n+60 16-980 8736 (https://hafjetraub.wasap.my/)"
+    end_time = time.time()
+    print(f"[hermes_ai] [ASK_HERMES] Total time: {end_time - start_time:.2f} seconds")
+    return fallback_msg
