@@ -4,9 +4,10 @@ dst = os.path.join(src, "deploy-hafjet-bot.zip")
 
 exclude_patterns = [
     ".git", "__pycache__", ".venv", ".env", ".env.", "node_modules",
-    ".bak", ".backup", "test_", "test_", ".zip", "logs",
+    ".bak", ".backup", "test_", ".zip", "logs",
     ".backup", "hermes_ai.py.backup", "hermes_ai_new.py",
     "update_fallback.py", "fix_fallback.py",
+    ".db",  # exclude all database files (bot_data.db, etc.)
 ]
 
 def should_exclude(name):

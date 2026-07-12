@@ -17,7 +17,9 @@ import hmac
 import logging
 import re as _re
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import httpx
@@ -65,6 +67,15 @@ from db_logger import (
     update_staff_status, assign_conversation, get_inbox_conversations,
     update_conversation_status, get_staff_whatsapp, set_escalation_notified,
     get_customer_detail,
+
+    # SPX self-collection
+    get_spx_due_orders, get_all_spx_orders, update_spx_reminder_state, get_spx_stats,
+    get_spx_order_by_tracking, VALID_SPX_STATUSES,
+    import_spx_csv, upsert_spx_order, get_orders_missing_phone,
+    update_order_phone, save_spx_cookies, get_spx_cookies,
+    count_spx_reminders_sent_today,
+    load_sync_progress, save_sync_progress,
+    bulk_map_phones, _normalize_phone,
 )
 
 # ── APScheduler ──────────────────────────────────────────────────────
@@ -106,6 +117,15 @@ log = logging.getLogger("hafjet-whatsapp")
 
 # ── APScheduler ──────────────────────────────────────────────────────
 _scheduler = AsyncIOScheduler()
+_spx_lock = asyncio.Lock()
+
+# ── SPX Incremental Sync Progress State (DB-backed) ────────────────
+_sync_progress = load_sync_progress()
+
+_SYNC_BATCH_SIZE = 150         # orders per page (was 50)
+_SYNC_PHONE_BATCH = 10         # phone fetches per tick
+_SYNC_INTERVAL_SECONDS = 15    # seconds between ticks (was 30)
+_SYNC_MAX_IDLE_SECONDS = 900   # 15 min — auto-terminate if no progress
 
 # ── Escalation keywords (from runtime config, fallback to hardcoded) ─
 DEFAULT_ESCALATION_KEYWORDS = [
@@ -130,6 +150,7 @@ MYT = timezone(timedelta(hours=8))
 _PROTECTED_PREFIXES = [
     "/api/settings",
     "/api/customers/",
+    "/api/spx/phones/from-agent",
 ]
 
 @app.middleware("http")
@@ -476,6 +497,628 @@ async def _check_escalation_timeout():
     except Exception as e:
         log.error(f"❌ _check_escalation_timeout error: {e}", exc_info=True)
 
+
+async def _check_spx_reminders():
+    """SPX reminder scheduler — pilot batch: max 60/day, ReadyForCollection + 7 days, live send."""
+    loop = asyncio.get_event_loop()
+    try:
+        today_sent = await loop.run_in_executor(None, count_spx_reminders_sent_today)
+        if today_sent >= 60:
+            log.info(f"[SPX-LIMIT] daily cap 60 reached at {datetime.now(timezone.utc).isoformat()}")
+            return
+
+        # Enforce send window using Malaysia local time (Asia/Kuala_Lumpur)
+        now_utc = datetime.now(timezone.utc)
+        now_my = now_utc.astimezone(ZoneInfo("Asia/Kuala_Lumpur"))
+        if not (8 <= now_my.hour < 21):
+            log.info(f"[SPX] Outside Malaysia send window: {now_my.strftime('%H:%M')} MYT (server UTC {now_utc.strftime('%H:%M')})")
+            return
+
+        # Cursor: only ReadyForCollection + inbound within 7 days
+        due = []
+        try:
+            all_orders = await loop.run_in_executor(None, get_spx_due_orders, 200, 0)
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(days=7)
+            for o in all_orders:
+                if o.get("spx_status") != "ReadyForCollection":
+                    continue
+                inb = o.get("inbound_time")
+                if not inb:
+                    continue
+                try:
+                    inb_dt = datetime.fromisoformat(inb.replace(" ", "T"))
+                    if inb_dt.tzinfo is None:
+                        inb_dt = inb_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if inb_dt < cutoff:
+                    continue
+                due.append(o)
+        except Exception:
+            log.exception("[SPX] Failed to load due orders")
+            return
+
+        if not due:
+            log.info("[SPX] Pilot: no eligible ReadyForCollection orders in last 7 days")
+            return
+
+        log.info(f"[SPX] Pilot candidates: {len(due)} | sent today: {today_sent}")
+        sent_today = today_sent
+
+        for order in due:
+            if sent_today >= 60:
+                log.info("[SPX-LIMIT] daily cap 60 reached mid-batch")
+                break
+
+            # Guards
+            phone = order.get("recipient_phone")
+            if not phone:
+                continue
+            if order.get("is_paused") == 1:
+                continue
+            state = order.get("hafjet_reminder_state", "Pending")
+            if state in ("Completed", "CollectionFailed"):
+                continue
+
+            last_sent = order.get("last_reminder_sent_at")
+            if last_sent:
+                try:
+                    last_dt = datetime.fromisoformat(last_sent.replace(" ", "T"))
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - last_dt).total_seconds() < 12 * 3600:
+                        continue
+                except Exception:
+                    pass
+
+            # Determine next reminder state
+            next_state = _resolve_next_reminder_state(order)
+            if not next_state:
+                continue
+
+            text = _build_reminder_text(order, next_state)
+            # Send via free-form WhatsApp
+            ok = await send_whatsapp_message(phone, text)
+            if ok:
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                await loop.run_in_executor(
+                    None,
+                    update_spx_reminder_state,
+                    order["id"],
+                    next_state,
+                    now_str,
+                )
+                await log_outbound(phone, text, "spx_reminder", 0, False)
+                log.info(
+                    f"[SPX-PILOT] sent tracking={order['spx_tracking_number']} "
+                    f"phone={phone} template={next_state} time={now_str}"
+                )
+                sent_today += 1
+            else:
+                log.warning(
+                    f"[SPX-PILOT] send failed tracking={order['spx_tracking_number']} phone={phone}"
+                )
+
+    except Exception as e:
+        log.error(f"❌ _check_spx_reminders error: {e}", exc_info=True)
+
+
+def _resolve_next_reminder_state(order: dict) -> str | None:
+    """Return next reminder state based on order deadlines."""
+    now = datetime.now(timezone.utc)
+    try:
+        inb = order.get("inbound_time")
+        cbd = order.get("collect_by_date")
+        if not cbd:
+            return None
+        inb_dt = datetime.fromisoformat(inb.replace(" ", "T")) if inb else None
+        cbd_dt = datetime.fromisoformat(cbd.replace(" ", "T"))
+        if inb_dt:
+            if inb_dt.tzinfo is None:
+                inb_dt = inb_dt.replace(tzinfo=timezone.utc)
+        if cbd_dt.tzinfo is None:
+            cbd_dt = cbd_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+    # Thresholds
+    t1 = inb_dt.replace(hour=8, minute=0, second=0, microsecond=0) + timedelta(days=1) if inb_dt else None
+    t2 = cbd_dt.replace(hour=8, minute=0, second=0, microsecond=0) - timedelta(days=3)
+    t3 = cbd_dt.replace(hour=8, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    t4 = cbd_dt.replace(hour=8, minute=0, second=0, microsecond=0)
+    t5 = cbd_dt.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    cur = order.get("hafjet_reminder_state", "Pending")
+    if cur == "Pending":
+        if now >= t5:
+            return "CollectionFailed"
+        if now >= t4:
+            return "Remind4"
+        if now >= t3:
+            return "Remind3"
+        if now >= t2:
+            return "Remind2"
+        if t1 and now >= t1:
+            return "Remind1"
+    elif cur == "Remind1_Sent":
+        if now >= t5:
+            return "CollectionFailed"
+        if now >= t4:
+            return "Remind4"
+        if now >= t3:
+            return "Remind3"
+        if now >= t2:
+            return "Remind2"
+    elif cur == "Remind2_Sent":
+        if now >= t5:
+            return "CollectionFailed"
+        if now >= t4:
+            return "Remind4"
+        if now >= t3:
+            return "Remind3"
+    elif cur == "Remind3_Sent":
+        if now >= t5:
+            return "CollectionFailed"
+        if now >= t4:
+            return "Remind4"
+    elif cur == "Remind4_Sent":
+        if now >= t5:
+            return "CollectionFailed"
+    return None
+
+
+_REMINDER_TEMPLATES = {
+    "Remind1": "Salam {name}, parcel anda ({tracking}) telah tiba di HAFJET Collection Point. Sila ambil sebelum {collect_date}. Terima kasih!",
+    "Remind2": "Peringatan 2: Parcel anda ({tracking}) masih belum diambil. Tarikh akhir: {collect_date}. Sila ambil segera.",
+    "Remind3": "⚠️ Esok tarikh akhir! Parcel ({tracking}) perlu diambil sebelum {collect_date}. Hubungi kami jika ada masalah.",
+    "Remind4": "🚨 HARI INI tarikh akhir! Parcel ({tracking}) MESTI diambil hari ini atau akan dipulangkan.",
+    "CollectionFailed": "Maaf, parcel anda ({tracking}) tidak berjaya diambil dan akan dipulangkan kepada penghantar. Hubungi Shopee untuk bantuan lanjut.",
+}
+
+
+def _build_reminder_text(order: dict, state: str) -> str:
+    tpl = _REMINDER_TEMPLATES.get(state, _REMINDER_TEMPLATES["Remind1"])
+    try:
+        cbd = order.get("collect_by_date", "")
+        # convert "YYYY-MM-DD HH:MM:SS" -> "DD/MM/YYYY HH:MM" for friendliness
+        display = cbd
+        if cbd:
+            try:
+                dt = datetime.fromisoformat(cbd.replace(" ", "T"))
+                display = dt.strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                pass
+        return tpl.format(
+            name=order.get("recipient_name", "Customer"),
+            tracking=order.get("spx_tracking_number", ""),
+            collect_date=display,
+        )
+    except Exception:
+        return tpl.format(name="Customer", tracking=order.get("spx_tracking_number", ""), collect_date=order.get("collect_by_date", ""))
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SPX API INTEGRATION (TASK B — confirmed endpoints)
+# ═══════════════════════════════════════════════════════════════════
+
+_SPX_STATUS_MAP = {
+    1: "ReadyForCollection",
+    2: "Remind1",
+    3: "Remind2",
+    4: "Remind3",
+    5: "Remind4",
+    6: "Collected",
+    7: "CollectionFailed",
+    8: "Return_Outbound",
+    9: "Return_Packing",
+}
+
+# Normalise display names → DB/internal names for filter matching
+_SPX_STATUS_ALIASES = {
+    "ready for collection": "ReadyForCollection",
+    "readyforcollection": "ReadyForCollection",
+    "collection failed": "CollectionFailed",
+    "collectionfailed": "CollectionFailed",
+    "remind1": "Remind1",
+    "remind2": "Remind2",
+    "remind3": "Remind3",
+    "remind4": "Remind4",
+    "collected": "Collected",
+    "return_outbound": "Return_Outbound",
+    "return_packing": "Return_Packing",
+}
+
+
+def normalize_spx_status(status_int: int) -> str:
+    return _SPX_STATUS_MAP.get(status_int, f"Unknown_{status_int}")
+
+
+def _safe_json(text: str) -> dict:
+    """Parse JSON from SPX API response, stripping non-JSON prefix/suffix.
+    Shopee SPX API sometimes wraps JSON with anti-hijacking prefix like ``)]}'\n``
+    or may append trailing whitespace/garbage.
+    Returns {} on failure (never raises)."""
+    text = (text or "").strip()
+    if not text:
+        log.warning("🔸 _safe_json: empty body, returning {}")
+        return {}
+
+    # Locate first JSON bracket: '{' for object, '[' for array
+    start = -1
+    for ch in ("{", "["):
+        idx = text.find(ch)
+        if idx != -1 and (start == -1 or idx < start):
+            start = idx
+    if start == -1:
+        log.warning(f"🔸 _safe_json: no JSON bracket found in {len(text)}-byte response, returning {{}}")
+        return {}
+
+    trimmed = text[start:]
+
+    # Find matching end bracket via nesting counter
+    end = -1
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(trimmed):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"' and not esc:
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == trimmed[0]:
+            depth += 1
+        elif (trimmed[0] == "{" and ch == "}") or (trimmed[0] == "[" and ch == "]"):
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end == -1:
+        log.warning(f"🔸 _safe_json: unmatched bracket in {len(trimmed)}-byte response, returning {{}}")
+        return {}
+
+    try:
+        return json.loads(trimmed[:end])
+    except json.JSONDecodeError as e:
+        log.warning(f"🔸 _safe_json: parse failed at pos {e.pos}: {e.msg[:80]}, returning {{}}")
+        return {}
+
+async def fetch_spx_order_list(cookies: str, pageno: int = 1, count: int = 50) -> dict:
+    url = "https://sp.spx.shopee.com.my/sp-api/point/order/collection/list"
+    now = int(time.time())
+    params = {
+        "inbound_time_start": now - (90 * 24 * 3600),
+        "inbound_time_end": now,
+        "pageno": pageno,
+        "count": count,
+    }
+    headers = {
+        "Cookie": cookies,
+        "Referer": "https://sp.spx.shopee.com.my/",
+        "Origin": "https://sp.spx.shopee.com.my",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params, headers=headers)
+        body = resp.text or ""
+        # Log truncated raw body for debugging JSON parse errors
+        log.debug("[SPX-DEBUG] GET %s status=%s body(500)=%.500s", url, resp.status_code, body)
+        if resp.status_code == 401:
+            raise Exception("SPX_SESSION_EXPIRED")
+        resp.raise_for_status()
+        blen = len(body.strip())
+        if blen == 0:
+            log.warning("⚠️ SPX order list response body empty — treating as no orders")
+            return {}
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            return _safe_json(body)
+
+
+def _extract_sap_headers(cookies: str) -> dict:
+    """Extract SPX SAP security headers from cookie string, if present.
+    x-sap-ri / x-sap-sec are JS-generated headers (NOT stored as cookies).
+    They may be embedded as sap_ri= / sap_sec= in the stored cookie string
+    by the dashboard SPX config page for manual paste.
+    Returns empty dict if not found (caller falls back to cookies-only)."""
+    result = {}
+    if not cookies:
+        return result
+    for name, pattern in [
+        ("x-sap-ri", r'(?:x-)?sap[-_]ri=([^;\s]+)'),
+        ("x-sap-sec", r'(?:x-)?sap[-_]sec=([^;\s]+)'),
+    ]:
+        m = _re.search(pattern, cookies, _re.I)
+        if m:
+            result[name] = m.group(1)
+            log.debug("[SPX-SAP] ✅ %s extracted (len=%d)", name, len(result[name]))
+    return result
+
+
+async def fetch_spx_phone(cookies: str, entity_id: str, tracking_number: str) -> str | None:
+    url = "https://sp.spx.shopee.com.my/sp-api/order/show_secret"
+    payload = {
+        "entity_id": str(entity_id),
+        "entity_type": 2,
+        "info_type": 2,
+        "query_id": tracking_number,
+        "view_channel": 2,
+    }
+    sap_headers = _extract_sap_headers(cookies)
+    headers = {
+        "Cookie": cookies,
+        "Content-Type": "application/json;charset=UTF-8",
+        "Referer": "https://sp.spx.shopee.com.my/",
+        "Origin": "https://sp.spx.shopee.com.my",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "device-id": "v2-MmYeRgaFMgI2X-ZbOc_fC",
+        "app": "SP Portal",
+        "version": "@servicepoint/vue-project:1.0.0-231130",
+    }
+    if sap_headers.get("x-sap-ri"):
+        headers["x-sap-ri"] = sap_headers["x-sap-ri"]
+    if sap_headers.get("x-sap-sec"):
+        headers["x-sap-sec"] = sap_headers["x-sap-sec"]
+    if not sap_headers:
+        log.warning("[SPX-PHONE] ⚠️ No SAP headers in cookies — phone fetch may fail for %s", tracking_number)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        body = resp.text or ""
+        # Log truncated raw body for debugging JSON parse errors
+        log.debug("[SPX-DEBUG] POST %s status=%s body(500)=%.500s", url, resp.status_code, body)
+        if resp.status_code == 401:
+            raise Exception("SPX_SESSION_EXPIRED")
+        if resp.status_code != 200:
+            log.warning("⚠️ SPX phone fetch non-200: %s body(300)=%.300s", resp.status_code, body)
+            return None
+        blen = len(body.strip())
+        if blen == 0:
+            log.warning("⚠️ SPX phone response body empty — treating as no phone")
+            return None
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            data = _safe_json(body)
+        if data.get("retcode") == 0:
+            return data.get("data", {}).get("real_message")
+        log.warning("⚠️ SPX phone fetch retcode=%s body(300)=%.300s", data.get("retcode"), body)
+        return None
+
+
+async def batch_sync_spx_orders() -> dict:
+    cookies = get_spx_cookies()
+    if not cookies:
+        return {"error": "No SPX session configured"}
+
+    stats = {"synced": 0, "phones_fetched": 0, "errors": []}
+    stats["_version"] = "spx-incremental-sync-v2.2.1-csrf-fix"
+
+    # Step 1: Fetch all orders from SPX API
+    pageno = 1
+    while True:
+        try:
+            result = await fetch_spx_order_list(cookies, pageno=pageno, count=50)
+        except Exception as e:
+            stats["errors"].append(str(e))
+            break
+
+        orders = result.get("data", {}).get("list", [])
+        if not orders:
+            break
+
+        # Debug: log first order field types
+        if pageno == 1 and orders:
+            sample = orders[0]
+            log.info("🔍 First SPX order sample keys: %s", list(sample.keys())[:20])
+            for _k in ["id", "shipment_id", "scan_tracking_number", "recipient_name",
+                        "inbound_time", "outbound_time", "collect_time", "status", "storage_id"]:
+                _v = sample.get(_k)
+                log.info("🔍 SPX field %r type=%s repr=%s", _k, type(_v).__name__, repr(_v)[:80])
+
+        for order in orders:
+            inbound = datetime.fromtimestamp(order["inbound_time"]).strftime("%Y-%m-%d %H:%M:%S") if order.get("inbound_time") else None
+            outbound = datetime.fromtimestamp(order["outbound_time"]).strftime("%Y-%m-%d %H:%M:%S") if order.get("outbound_time") else None
+            collect = datetime.fromtimestamp(order["collect_time"]).strftime("%Y-%m-%d %H:%M:%S") if order.get("collect_time") else None
+
+            try:
+                # Convert all fields to safe types before upsert
+                upsert_spx_order({
+                    "entity_id": str(order["id"]),
+                    "spx_tracking_number": str(order.get("shipment_id", "")),
+                    "scan_tracking_number": str(order.get("scan_tracking_number") or ""),
+                    "recipient_name": str(order.get("recipient_name") or ""),
+                    "inbound_time": inbound,
+                    "outbound_time": outbound,
+                    "collect_by_date": collect,
+                    "spx_status": normalize_spx_status(order.get("status", 0)),
+                    "storage_id": str(order.get("storage_id", "")),
+                })
+                stats["synced"] += 1
+            except Exception as exc:
+                log.error(f"❌ upsert_spx_order FAILED for {order.get('shipment_id')}", exc_info=True)
+                stats["errors"].append(f"upsert {order.get('shipment_id')}: {exc}")
+
+        total = result.get("data", {}).get("total", 0)
+        if pageno * 50 >= total:
+            break
+        pageno += 1
+        await asyncio.sleep(0.3)
+
+    # Step 2: Batch fetch phones
+    missing = get_orders_missing_phone()
+    for order in missing:
+        if not order.get("entity_id"):
+            continue
+        try:
+            phone = await fetch_spx_phone(cookies, order["entity_id"], order["spx_tracking_number"])
+            if phone:
+                update_order_phone(order["id"], phone)
+                stats["phones_fetched"] += 1
+        except Exception as exc:
+            # Bubble up session expiry so caller can report it
+            if "SPX_SESSION_EXPIRED" in str(exc):
+                stats["errors"].append("SPX_SESSION_EXPIRED")
+                break
+            stats["errors"].append(f"{order['spx_tracking_number']}: {exc}")
+        await asyncio.sleep(0.5)
+
+    return stats
+
+
+# ── Incremental Background Sync (triggered by api_spx_sync, runs every 30s) ──
+
+async def _sync_spx_batch():
+    """Process one batch of SPX sync per tick (called by APScheduler).
+    State machine: idle → fetching_orders → fetching_phones → completed.
+    Runs only if _sync_progress['running'] is True."""
+    global _sync_progress
+    prog = _sync_progress
+    if not prog["running"]:
+        return  # nothing to do
+
+    # ── Auto-terminate if no progress for >15 min ──
+    if prog["last_progress_at"] and prog["phase"] in ("fetching_orders", "fetching_phones"):
+        elapsed = time.time() - prog["last_progress_at"]
+        if elapsed > _SYNC_MAX_IDLE_SECONDS:
+            log.warning("[SPX-SYNC] ⏰ Auto-terminate — no progress for %.0fs (>%ds)",
+                        elapsed, _SYNC_MAX_IDLE_SECONDS)
+            prog["running"] = False
+            prog["phase"] = "failed"
+            prog["last_error"] = f"Auto-terminated: no progress for {elapsed:.0f}s"
+            return
+
+    async with _spx_lock:
+        try:
+            cookies = get_spx_cookies()
+            if not cookies:
+                prog["running"] = False
+                prog["phase"] = "failed"
+                prog["last_error"] = "No SPX session configured"
+                return
+
+            # ── Phase 1: Fetch orders page-by-page ──
+            if prog["phase"] == "fetching_orders":
+                prog["current_page"] += 1
+                page = prog["current_page"]
+                log.info("[SPX-SYNC] ⏳ Page %d/%d — syncing orders...", page, prog["total_pages"])
+
+                result = await fetch_spx_order_list(cookies, pageno=page, count=_SYNC_BATCH_SIZE)
+                orders = result.get("data", {}).get("list", [])
+                if not orders:
+                    # No more orders — move to phone fetching
+                    prog["phase"] = "fetching_phones"
+                    missing = get_orders_missing_phone()
+                    prog["total_missing_phones"] = len(missing)
+                    log.info("[SPX-SYNC] ✅ All pages done. %d orders missing phone. Starting phone fetch...", len(missing))
+                    return  # next tick will pick up phones
+
+                for order in orders:
+                    inbound = datetime.fromtimestamp(order["inbound_time"]).strftime("%Y-%m-%d %H:%M:%S") if order.get("inbound_time") else None
+                    outbound = datetime.fromtimestamp(order["outbound_time"]).strftime("%Y-%m-%d %H:%M:%S") if order.get("outbound_time") else None
+                    collect = datetime.fromtimestamp(order["collect_time"]).strftime("%Y-%m-%d %H:%M:%S") if order.get("collect_time") else None
+                    try:
+                        upsert_spx_order({
+                            "entity_id": str(order["id"]),
+                            "spx_tracking_number": str(order.get("shipment_id", "")),
+                            "scan_tracking_number": str(order.get("scan_tracking_number") or ""),
+                            "recipient_name": str(order.get("recipient_name") or ""),
+                            "inbound_time": inbound,
+                            "outbound_time": outbound,
+                            "collect_by_date": collect,
+                            "spx_status": normalize_spx_status(order.get("status", 0)),
+                            "storage_id": str(order.get("storage_id", "")),
+                        })
+                        prog["synced"] += 1
+                    except Exception as exc:
+                        log.error("[SPX-SYNC] ❌ upsert FAILED for %s: %s", order.get("shipment_id"), exc)
+                        prog["errors"].append(f"upsert {order.get('shipment_id')}: {exc}")
+                        prog["last_error"] = str(exc)
+
+                total = result.get("data", {}).get("total", 0)
+                prog["total_orders"] = total
+                prog["total_pages"] = (total + _SYNC_BATCH_SIZE - 1) // _SYNC_BATCH_SIZE
+                prog["last_progress_at"] = time.time()
+                log.info("[SPX-SYNC] ✅ Page %d/%d done — %d synced so far", page, prog["total_pages"], prog["synced"])
+
+                # If this was the last page, switch to phone fetching
+                if page * _SYNC_BATCH_SIZE >= total:
+                    prog["phase"] = "fetching_phones"
+                    prog["phone_fetch_offset"] = 0
+                    missing = get_orders_missing_phone(limit=1, offset=0)
+                    prog["total_missing_phones"] = len(missing)
+                    log.info("[SPX-SYNC] ✅ All pages done. %d orders missing phone. Starting phone fetch...", len(missing))
+
+            # ── Phase 2: Fetch phones in batches ──
+            elif prog["phase"] == "fetching_phones":
+                offset = prog["phone_fetch_offset"]
+                missing = get_orders_missing_phone(limit=_SYNC_PHONE_BATCH, offset=offset)
+                if not missing:
+                    prog["running"] = False
+                    prog["phase"] = "completed"
+                    prog["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    log.info("[SPX-SYNC] ✅ COMPLETE — %d synced, %d phones fetched, %d errors",
+                             prog["synced"], prog["phones_fetched"], len(prog["errors"]))
+                    return
+
+                for order in missing:
+                    try:
+                        phone = await fetch_spx_phone(cookies, order["entity_id"], order["spx_tracking_number"])
+                        if phone:
+                            update_order_phone(order["id"], phone)
+                            prog["phones_fetched"] += 1
+                    except Exception as exc:
+                        if "SPX_SESSION_EXPIRED" in str(exc):
+                            prog["errors"].append("SPX_SESSION_EXPIRED")
+                            prog["last_error"] = "SPX_SESSION_EXPIRED"
+                            prog["running"] = False
+                            prog["phase"] = "failed"
+                            return
+                        prog["errors"].append(f"{order['spx_tracking_number']}: {exc}")
+                        prog["last_error"] = str(exc)
+                    await asyncio.sleep(0.5)
+
+                # Move offset forward regardless of success/failure — avoids infinite loop
+                prog["phone_fetch_offset"] = offset + len(missing)
+
+                remaining = max(0, prog["total_missing_phones"] - prog["phones_fetched"])
+                prog["last_progress_at"] = time.time()
+                log.info("[SPX-SYNC] 📞 Phone batch done — %d fetched, ~%d remaining",
+                         prog["phones_fetched"], remaining)
+
+        except Exception as exc:
+            prog["running"] = False
+            prog["phase"] = "failed"
+            prog["last_error"] = str(exc)
+            log.error("[SPX-SYNC] ❌ Batch failed: %s", exc, exc_info=True)
+        finally:
+            # Persist progress to DB — survives restarts & consistent across workers
+            save_sync_progress(prog)
+
+
+async def _ensure_sync_job():
+    """Add the incremental sync job to the scheduler if not already added."""
+    if not _scheduler.get_job("spx_incremental_sync"):
+        _scheduler.add_job(
+            _sync_spx_batch,
+            IntervalTrigger(seconds=_SYNC_INTERVAL_SECONDS),
+            id="spx_incremental_sync",
+            replace_existing=True,
+        )
+        log.info("[SPX-SYNC] 🔄 Incremental sync job registered (every %ds)", _SYNC_INTERVAL_SECONDS)
+
+
 async def _process_message(msg: dict, value: dict):
     """Process satu mesej masuk."""
     msg_type = msg.get("type", "")
@@ -670,9 +1313,9 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 msg = await asyncio.wait_for(websocket.receive_text(), timeout=60)
                 if msg == "ping":
-                    await websocket.send_text("pong")
+                    await websocket.send_json({"type": "pong"})
             except asyncio.TimeoutError:
-                await websocket.send_text("pong")
+                await websocket.send_json({"type": "pong"})
     except Exception:
         pass
     finally:
@@ -1019,6 +1662,20 @@ async def startup_event():
         _check_escalation_timeout,
         IntervalTrigger(minutes=5),
         id="escalation_timeout_check",
+        replace_existing=True,
+    )
+    # Start APScheduler for SPX self-collection reminders (dry-run)
+    _scheduler.add_job(
+        _check_spx_reminders,
+        IntervalTrigger(minutes=15),
+        id="spx_reminder_check",
+        replace_existing=True,
+    )
+    # Register incremental sync job (paused — activated by POST /api/spx/sync)
+    _scheduler.add_job(
+        _sync_spx_batch,
+        IntervalTrigger(seconds=_SYNC_INTERVAL_SECONDS),
+        id="spx_incremental_sync",
         replace_existing=True,
     )
     _scheduler.start()
@@ -1448,6 +2105,398 @@ async def api_blast_history(limit: int = 50):
     except Exception as e:
         log.error(f"❌ api_blast_history failed: {e}", exc_info=True)
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SPX SELF-COLLECTION API
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/spx/orders")
+async def api_spx_orders(
+    status: str = "",
+    storage_id: str = "",
+    search: str = "",
+    page: int = 1,
+    limit: int = 50,
+    staff: dict = Depends(get_current_staff),
+):
+    """List SPX orders with optional filters."""
+    try:
+        loop = asyncio.get_event_loop()
+        # Build query with filters (lightweight — use Python filtering for small datasets)
+        all_orders = await loop.run_in_executor(None, get_all_spx_orders, 10000, 0)
+        if status:
+            _normalised = _SPX_STATUS_ALIASES.get(status.lower().strip(), status)
+            all_orders = [o for o in all_orders if o.get("spx_status") == _normalised]
+        if storage_id:
+            all_orders = [o for o in all_orders if o.get("storage_id") == storage_id]
+        if search:
+            s = search.lower()
+            all_orders = [
+                o for o in all_orders
+                if s in (o.get("spx_tracking_number") or "").lower()
+                or s in (o.get("recipient_name") or "").lower()
+                or s in (o.get("recipient_phone") or "").lower()
+            ]
+        total = len(all_orders)
+        start = (page - 1) * limit
+        page_items = all_orders[start:start + limit]
+        return {"orders": page_items, "total": total, "page": page, "limit": limit}
+    except Exception as e:
+        log.error(f"❌ api_spx_orders failed: {e}", exc_info=True)
+        return {"orders": [], "total": 0, "page": 1, "limit": limit}
+
+
+@app.post("/api/spx/import-csv")
+async def api_spx_import_csv(request: Request, staff: dict = Depends(get_current_staff)):
+    """Import SPX orders from CSV upload."""
+    try:
+        form = await request.form()
+        upload = form.get("file")
+        if not upload:
+            return JSONResponse({"error": "CSV file is required"}, status_code=400)
+        content = await upload.read()
+        csv_text = content.decode("utf-8", errors="replace")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, import_spx_csv, csv_text)
+        return {"status": "ok", **result}
+    except Exception as e:
+        log.error(f"❌ api_spx_import_csv failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _process_agent_phones(orders: list) -> dict:
+    """Process phone data from browser agent. Idempotent — safe to re-send.
+    
+    Each order dict: {tracking, phone, name?, status?, source?, seen_at?}
+    Returns: {updated, skipped, not_found, errors}
+    """
+    conn = _get_db()
+    updated = skipped = not_found = 0
+    errors = []
+    
+    for order in orders:
+        tracking = (order.get("tracking") or "").strip().upper()
+        phone_raw = (order.get("phone") or "").strip()
+        name = (order.get("name") or "").strip()
+        
+        if not tracking:
+            errors.append({"tracking": tracking, "reason": "Missing tracking number"})
+            skipped += 1
+            continue
+        
+        # Normalize phone (same logic as db_logger._normalize_phone)
+        phone = _normalize_phone(phone_raw) if phone_raw else ""
+        if not phone:
+            errors.append({"tracking": tracking, "reason": "Invalid phone: {}".format(phone_raw)})
+            skipped += 1
+            continue
+        
+        # Find existing order
+        row = conn.execute(
+            "SELECT id, recipient_phone, recipient_name FROM spx_self_collection_orders WHERE spx_tracking_number=?",
+            (tracking,),
+        ).fetchone()
+        
+        if not row:
+            errors.append({"tracking": tracking, "reason": "Tracking not found in DB"})
+            not_found += 1
+            continue
+        
+        # Skip if phone already matches
+        existing_phone = row["recipient_phone"] or ""
+        if existing_phone == phone:
+            skipped += 1
+            continue
+        
+        # Update phone (and name if provided)
+        if name and (row["recipient_name"] or "") != name:
+            conn.execute(
+                "UPDATE spx_self_collection_orders SET recipient_phone=?, recipient_name=?, updated_at=datetime('now') WHERE id=?",
+                (phone, name, row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE spx_self_collection_orders SET recipient_phone=?, updated_at=datetime('now') WHERE id=?",
+                (phone, row["id"]),
+            )
+        updated += 1
+    
+    conn.commit()
+    conn.close()
+    
+    log.info("[SPX-AGENT] Processed {} orders: updated={}, skipped={}, not_found={}, errors={}".format(
+        len(orders), updated, skipped, not_found, len(errors)))
+    
+    return {"updated": updated, "skipped": skipped, "not_found": not_found, "errors": errors[:50]}
+
+
+@app.post("/api/spx/phones/bulk")
+async def api_spx_phones_bulk(data: dict, staff: dict = Depends(get_current_staff)):
+    """Bulk map tracking_number → phone from text input.
+    Request: {"text": "SPXMY... 0123456789\\nSPXMY... 0123456790"}"""
+    try:
+        text = (data.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "text is required"}, status_code=400)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, bulk_map_phones, text)
+        return {"status": "ok", **result}
+    except Exception as e:
+        log.error(f"❌ api_spx_phones_bulk failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/spx/phones/from-agent")
+async def api_spx_phones_from_agent(request: Request):
+    """Receive phone data from browser-side SPX agent (Tampermonkey).
+    
+    Auth: X-API-Key header (DASHBOARD_API_KEY) — checked by middleware.
+    
+    Request body:
+      Single: {"tracking": "SPXMY...", "phone": "601133114781", "name": "...", "status": "ReadyForCollection", "source": "spx-agent", "seen_at": "..."}
+      Batch:  {"orders": [{...}, {...}]}
+    
+    Backend handles: normalize phone, find order by tracking, update DB.
+    Idempotent — safe to re-send same tracking+phone.
+    """
+    try:
+        body = await request.json()
+        
+        # Accept both single and batch
+        orders = body.get("orders", [body] if "tracking" in body else [])
+        if not orders:
+            return JSONResponse({"error": "Missing 'tracking' field or 'orders' array"}, status_code=400)
+        
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _process_agent_phones, orders)
+        return {"status": "ok", **result}
+    except Exception as e:
+        log.error(f"api_spx_phones_from_agent failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.patch("/api/spx/orders/{order_id}")
+async def api_spx_update_order(order_id: int, data: dict, staff: dict = Depends(get_current_staff)):
+    """Update SPX order fields: spx_status, is_paused, notes."""
+    try:
+        allowed = {"spx_status", "is_paused", "notes"}
+        updates = {k: v for k, v in data.items() if k in allowed}
+        if not updates:
+            return JSONResponse({"error": "No updatable fields provided"}, status_code=400)
+        conn = _get_db()
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), order_id]
+        conn.execute(f"UPDATE spx_self_collection_orders SET {set_clause}, updated_at=? WHERE id=?", vals)
+        conn.commit()
+        row = conn.execute("SELECT * FROM spx_self_collection_orders WHERE id=?", (order_id,)).fetchone()
+        conn.close()
+        return {"status": "ok", "order": dict(row) if row else None}
+    except Exception as e:
+        log.error(f"❌ api_spx_update_order failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/spx/orders/{order_id}/collected")
+async def api_spx_mark_collected(order_id: int, staff: dict = Depends(get_current_staff)):
+    """Mark order as Collected and stop reminders."""
+    try:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        conn = _get_db()
+        conn.execute(
+            """UPDATE spx_self_collection_orders
+               SET spx_status='Collected', hafjet_reminder_state='Completed',
+                   outbound_time=?, updated_at=?
+               WHERE id=?""",
+            (now_str, now_str, order_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM spx_self_collection_orders WHERE id=?", (order_id,)).fetchone()
+        conn.close()
+        return {"status": "ok", "order": dict(row) if row else None}
+    except Exception as e:
+        log.error(f"❌ api_spx_mark_collected failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/spx/stats")
+async def api_spx_stats(staff: dict = Depends(get_current_staff)):
+    """Get SPX reminder dashboard stats."""
+    try:
+        loop = asyncio.get_event_loop()
+        stats = await loop.run_in_executor(None, get_spx_stats)
+        return stats
+    except Exception as e:
+        log.error(f"❌ api_spx_stats failed: {e}", exc_info=True)
+        return {"total": 0, "by_status": {}, "rows": []}
+
+
+@app.post("/api/spx/session")
+async def api_spx_set_session(data: dict, staff: dict = Depends(get_current_staff)):
+    """Save SPX session cookies."""
+    cookies = (data.get("cookies") or "").strip()
+    if not cookies:
+        return JSONResponse({"error": "cookies is required"}, status_code=400)
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, save_spx_cookies, cookies)
+        return {"saved": True}
+    except Exception as e:
+        log.error(f"❌ api_spx_set_session failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/spx/session-status")
+async def api_spx_session_status(staff: dict = Depends(get_current_staff)):
+    """Test SPX session by making a lightweight list call."""
+    cookies = get_spx_cookies()
+    if not cookies:
+        return {"active": False, "error": "No session configured"}
+    try:
+        result = await fetch_spx_order_list(cookies, pageno=1, count=1)
+        total = result.get("data", {}).get("total", 0)
+        return {"active": True, "total": total, "error": None, "deploy_version": "spx-incremental-sync-v2.2.1-csrf-fix"}
+    except Exception as exc:
+        err = str(exc)
+        if "SPX_SESSION_EXPIRED" in err:
+            return JSONResponse({"active": False, "error": "SPX_SESSION_EXPIRED"}, status_code=401)
+        return JSONResponse({"active": False, "error": err}, status_code=500)
+
+
+@app.post("/api/spx/sync")
+async def api_spx_sync(staff: dict = Depends(get_current_staff)):
+    """Trigger background incremental SPX sync (returns immediately)."""
+    global _sync_progress
+    try:
+        cookies = get_spx_cookies()
+        if not cookies:
+            return JSONResponse({"error": "No SPX session configured"}, status_code=400)
+
+        # Reset progress state and persist immediately
+        _sync_progress = {
+            "running": True,
+            "phase": "fetching_orders",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "last_progress_at": time.time(),
+            "current_page": 0,
+            "total_pages": 0,
+            "total_orders": 0,
+            "synced": 0,
+            "phones_fetched": 0,
+            "total_missing_phones": 0,
+            "phone_fetch_offset": 0,
+            "errors": [],
+            "last_error": None,
+        }
+        save_sync_progress(_sync_progress)
+
+        # Ensure the incremental job is registered
+        await _ensure_sync_job()
+
+        log.info("[SPX-SYNC] 🔄 Sync triggered — processing %d orders/page every %ds",
+                 _SYNC_BATCH_SIZE, _SYNC_INTERVAL_SECONDS)
+        return JSONResponse({
+            "status": "accepted",
+            "message": f"Sync started — processing {_SYNC_BATCH_SIZE} orders per batch, check /api/spx/sync-progress for status",
+        }, status_code=202)
+    except Exception as e:
+        log.error(f"❌ api_spx_sync trigger failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/spx/sync-progress")
+async def api_spx_sync_progress(staff: dict = Depends(get_current_staff)):
+    """Get current sync progress (polled by frontend)."""
+    global _sync_progress
+    return {
+        **_sync_progress,
+        "errors": _sync_progress["errors"][-10:],  # last 10 errors only
+        "deploy_version": "spx-incremental-sync-v2.2.1-csrf-fix",
+    }
+
+
+@app.post("/api/spx/sync-reset")
+async def api_spx_sync_reset(staff: dict = Depends(get_current_staff)):
+    """Force-reset sync state (stuck recovery)."""
+    global _sync_progress
+    _sync_progress = {
+        "running": False,
+        "phase": "idle",
+        "started_at": None,
+        "completed_at": None,
+        "last_progress_at": None,
+        "current_page": 0,
+        "total_pages": 0,
+        "total_orders": 0,
+        "synced": 0,
+        "phones_fetched": 0,
+        "total_missing_phones": 0,
+        "phone_fetch_offset": 0,
+        "errors": [],
+        "last_error": None,
+    }
+    save_sync_progress(_sync_progress)
+    log.info("[SPX-SYNC] 🔄 Sync state force-reset by staff")
+    return {"status": "ok", "message": "Sync state reset"}
+
+
+@app.post("/api/spx/fetch-phones")
+async def api_spx_fetch_phones(staff: dict = Depends(get_current_staff)):
+    """Dedicated endpoint to ONLY fetch phone numbers for orders missing them.
+    Does NOT re-fetch orders from SPX — just fills in missing phone numbers.
+    Useful when phone column shows '-' after orders are already synced."""
+    try:
+        cookies = get_spx_cookies()
+        if not cookies:
+            return JSONResponse({"error": "No SPX session configured"}, status_code=400)
+
+        # Count missing phones
+        missing = get_orders_missing_phone(limit=1, offset=0)
+        total_missing = get_orders_missing_phone(limit=99999, offset=0)
+        total_count = len(total_missing) if isinstance(total_missing, list) else 0
+
+        if total_count == 0:
+            return {"status": "ok", "processed": 0, "total_missing": 0,
+                    "message": "No orders missing phone numbers"}
+
+        # Process in batches to avoid timeout
+        batch_size = 10
+        processed = 0
+        errors = []
+        sap_headers = _extract_sap_headers(cookies)
+
+        for offset in range(0, total_count, batch_size):
+            batch = get_orders_missing_phone(limit=batch_size, offset=offset)
+            if not batch:
+                break
+            for order in batch:
+                if not order.get("entity_id"):
+                    continue
+                try:
+                    phone = await fetch_spx_phone(cookies, order["entity_id"], order["spx_tracking_number"])
+                    if phone:
+                        update_order_phone(order["id"], phone)
+                        processed += 1
+                except Exception as exc:
+                    if "SPX_SESSION_EXPIRED" in str(exc):
+                        return JSONResponse({"error": "SPX_SESSION_EXPIRED",
+                                             "processed": processed,
+                                             "message": "Session expired — please re-login to SPX"},
+                                            status_code=401)
+                    errors.append(f"{order['spx_tracking_number']}: {exc}")
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(1)  # rate limit between batches
+
+        return {
+            "status": "ok",
+            "processed": processed,
+            "total_missing": total_count,
+            "errors": errors[:10],  # last 10 only
+            "message": f"Fetched {processed}/{total_count} phone numbers",
+        }
+    except Exception as e:
+        log.error(f"❌ api_spx_fetch_phones failed: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ═══════════════════════════════════════════════════════════════════

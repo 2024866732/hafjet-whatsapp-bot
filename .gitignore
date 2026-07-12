@@ -2,10 +2,12 @@
 __pycache__/
 *.pyc
 *.pyo
+*.db
 
 # Environment
 .env
 .env.local
+.env.production
 
 # IDE
 .vscode/
@@ -21,3 +23,42 @@ build/
 
 # Dashboard dist — INCLUDED in deployment (served from FastAPI)
 !dashboard/dist/
+dashboard/node_modules/
+
+# Temp / debug / test files
+test_*.py
+*_test.py
+check_*.py
+debug_*.py
+monitor_*.py
+verify_*.py
+upload_*.py
+run_*.py
+fix_*.py
+update_*.py
+s2f5_test.py
+apply_all_patches.py
+start_local.sh
+intent_rules.json
+media_map.json
+system_prompt.txt
+business_info.txt
+oracle-deployment-plan-v2.md
+DEPLOYMENT.md
+DEPLOYMENT_NOTES.md
+*.bak-*
+*.backup
+*.user.js
+azure-settings-backup-*.json
+
+# Database backups
+prod_*.db
+verify_*.db
+test_*.db
+monitor_*.db
+
+# Logs
+logs/
+
+# Backup directories
+.backup/

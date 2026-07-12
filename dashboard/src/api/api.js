@@ -285,7 +285,7 @@ export function connectWebSocket(onMessage, onConnect, onDisconnect) {
         const data = JSON.parse(event.data);
         if (onMessage) onMessage(data);
       } catch (e) {
-        console.error('WS parse error:', e);
+        // Ignore non-JSON messages (heartbeat pong, etc.)
       }
     };
 
@@ -384,4 +384,110 @@ export async function updateConversationStatus(phone, status) {
   const result = await res.json();
   if (!res.ok) throw new Error(result.error || result.detail || 'Failed to update status');
   return result;
+}
+
+// === SPX SELF-COLLECTION ===
+
+export async function fetchSPXOrders({ status = '', storage_id = '', search = '', page = 1, limit = 50 } = {}) {
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  if (storage_id) params.set('storage_id', storage_id);
+  if (search) params.set('search', search);
+  params.set('page', page);
+  params.set('limit', limit);
+  const res = await fetch(`${API_BASE}/api/spx/orders?${params}`, {
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error('Failed to fetch SPX orders');
+  return res.json();
+}
+
+export async function importSPXCSV(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const authHeaders = getAuthHeaders();
+  delete authHeaders['Content-Type'];
+  const res = await fetch(`${API_BASE}/api/spx/import-csv`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: form,
+  });
+  if (!res.ok) throw new Error('Failed to import SPX CSV');
+  return res.json();
+}
+
+export async function bulkMapPhones(text) {
+  const res = await fetch(`${API_BASE}/api/spx/phones/bulk`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error('Failed to bulk map phones');
+  return res.json();
+}
+
+export async function updateSPXOrder(orderId, data) {
+  const res = await fetch(`${API_BASE}/api/spx/orders/${encodeURIComponent(orderId)}`, {
+    method: 'PATCH',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error('Failed to update SPX order');
+  return res.json();
+}
+
+export async function markSPXCollected(orderId) {
+  const res = await fetch(`${API_BASE}/api/spx/orders/${encodeURIComponent(orderId)}/collected`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error('Failed to mark collected');
+  return res.json();
+}
+
+export async function fetchSPXStats() {
+  const res = await fetch(`${API_BASE}/api/spx/stats`, {
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error('Failed to fetch SPX stats');
+  return res.json();
+}
+
+export async function saveSPXSession(cookies) {
+  const res = await fetch(`${API_BASE}/api/spx/session`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ cookies }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to save session');
+  return data;
+}
+
+export async function fetchSPXSessionStatus() {
+  const res = await fetch(`${API_BASE}/api/spx/session-status`, {
+    headers: getAuthHeaders(),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to check session');
+  return data;
+}
+
+export async function fetchSPXSync() {
+  const res = await fetch(`${API_BASE}/api/spx/sync`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to sync');
+  return data;
+}
+
+export async function fetchSPXSyncProgress() {
+  const res = await fetch(`${API_BASE}/api/spx/sync-progress`, {
+    headers: getAuthHeaders(),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Failed to get sync progress');
+  return data;
 }

@@ -183,7 +183,101 @@ def init_db():
             last_login TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_staff_email ON staff(email);
+
+        CREATE TABLE IF NOT EXISTS spx_self_collection_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id VARCHAR(50) NOT NULL,
+            spx_tracking_number VARCHAR(50) UNIQUE NOT NULL,
+            scan_tracking_number VARCHAR(50),
+            recipient_name VARCHAR(100),
+            recipient_phone VARCHAR(20),
+            payment_method VARCHAR(50),
+            transaction_method VARCHAR(50),
+            transaction_amount VARCHAR(20),
+            storage_id VARCHAR(50),
+            inbound_time TIMESTAMP,
+            outbound_time TIMESTAMP,
+            collect_by_date TIMESTAMP NOT NULL,
+            spx_status VARCHAR(50) DEFAULT 'ReadyForCollection',
+            hafjet_reminder_state VARCHAR(20) DEFAULT 'Pending',
+            last_reminder_sent_at TIMESTAMP,
+            is_paused INTEGER DEFAULT 0,
+            reminder_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT (datetime('now')),
+            updated_at TIMESTAMP DEFAULT (datetime('now')),
+            notes TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_spx_tracking ON spx_self_collection_orders(spx_tracking_number);
+        CREATE INDEX IF NOT EXISTS idx_spx_phone ON spx_self_collection_orders(recipient_phone);
+        CREATE INDEX IF NOT EXISTS idx_spx_deadline ON spx_self_collection_orders(collect_by_date);
+        CREATE INDEX IF NOT EXISTS idx_spx_status ON spx_self_collection_orders(spx_status);
+        CREATE INDEX IF NOT EXISTS idx_spx_reminder_state ON spx_self_collection_orders(hafjet_reminder_state);
+        CREATE INDEX IF NOT EXISTS idx_spx_storage ON spx_self_collection_orders(storage_id);
+
+        CREATE TABLE IF NOT EXISTS spx_session (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cookies TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS spx_sync_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TIMESTAMP DEFAULT (datetime('now'))
+        );
     """)
+
+    # SPX v2 schema migration: add entity_id; make recipient_phone nullable
+    _need_rebuild = False
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(spx_self_collection_orders)").fetchall()]
+        if "entity_id" not in cols:
+            _need_rebuild = True
+    except sqlite3.OperationalError:
+        _need_rebuild = True
+
+    if _need_rebuild:
+        conn.execute("DROP TABLE IF EXISTS spx_self_collection_orders")
+        conn.execute("""
+            CREATE TABLE spx_self_collection_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id VARCHAR(50) NOT NULL,
+                spx_tracking_number VARCHAR(50) UNIQUE NOT NULL,
+                scan_tracking_number VARCHAR(50),
+                recipient_name VARCHAR(100),
+                recipient_phone VARCHAR(20),
+                payment_method VARCHAR(50),
+                transaction_method VARCHAR(50),
+                transaction_amount VARCHAR(20),
+                storage_id VARCHAR(50),
+                inbound_time TIMESTAMP,
+                outbound_time TIMESTAMP,
+                collect_by_date TIMESTAMP NOT NULL,
+                spx_status VARCHAR(50) DEFAULT 'ReadyForCollection',
+                hafjet_reminder_state VARCHAR(20) DEFAULT 'Pending',
+                last_reminder_sent_at TIMESTAMP,
+                is_paused INTEGER DEFAULT 0,
+                reminder_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT (datetime('now')),
+                updated_at TIMESTAMP DEFAULT (datetime('now')),
+                notes TEXT
+            )
+        """)
+        conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_spx_tracking ON spx_self_collection_orders(spx_tracking_number);
+            CREATE INDEX IF NOT EXISTS idx_spx_phone ON spx_self_collection_orders(recipient_phone);
+            CREATE INDEX IF NOT EXISTS idx_spx_deadline ON spx_self_collection_orders(collect_by_date);
+            CREATE INDEX IF NOT EXISTS idx_spx_status ON spx_self_collection_orders(spx_status);
+            CREATE INDEX IF NOT EXISTS idx_spx_reminder_state ON spx_self_collection_orders(hafjet_reminder_state);
+            CREATE INDEX IF NOT EXISTS idx_spx_storage ON spx_self_collection_orders(storage_id);
+        """)
+        conn.commit()
+    # Seed default spx_session row id=1 if missing
+    cur = conn.execute("SELECT COUNT(*) FROM spx_session")
+    if cur.fetchone()[0] == 0:
+        conn.execute("INSERT OR IGNORE INTO spx_session (id, cookies) VALUES (1, '')")
+        conn.commit()
+
     # Seed default admin if no staff exists
     cur = conn.execute("SELECT COUNT(*) FROM staff")
     if cur.fetchone()[0] == 0:
@@ -625,6 +719,435 @@ def import_contacts_csv(csv_text: str) -> dict:
     conn.commit()
     conn.close()
     return {"imported": imported, "updated": updated, "errors": errors}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SPX SELF-COLLECTION ORDERS
+# ═══════════════════════════════════════════════════════════════════
+
+VALID_SPX_STATUSES = {
+    "Ready For Collection", "Remind1", "Remind2", "Remind3",
+    "Remind4", "Collected", "Collection Failed",
+    "Return_Outbound", "Return_Packing", "SP_Inbound",
+}
+
+
+def _normalize_phone(phone) -> str:
+    """Normalize phone number to international format.
+    Defensively handles non-string inputs (None, datetime, int, etc.)."""
+    if phone is None:
+        return ""
+    phone = str(phone).strip().replace(" ", "").replace("-", "")
+    if not phone:
+        return ""
+    if not phone.startswith("+"):
+        if phone.startswith("60"):
+            phone = "+" + phone
+        elif phone.startswith("0"):
+            phone = "+60" + phone[1:]
+    return phone
+
+
+def upsert_spx_order(data: dict) -> dict:
+    """Upsert one SPX order row by spx_tracking_number.
+    Never overwrite recipient_phone if order already has one.
+    Returns row dict.
+    """
+    conn = _get_db()
+    try:
+        # SAFETY: convert ALL values to strings upfront to prevent .strip() on non-str
+        for _k in list(data.keys()):
+            _v = data[_k]
+            if _v is not None and not isinstance(_v, (str, int, float)):
+                data[_k] = str(_v)
+
+        # Debug: log ALL field types before upsert
+        for _k in data:
+            _v = data[_k]
+            if _v is not None and not isinstance(_v, (str, type(None), int, float)):
+                import logging
+                logging.getLogger("hafjet-whatsapp.db").warning("🔥 NON-STRING field %r type=%s val=%r", _k, type(_v).__name__, str(_v)[:120])
+        # Debug: log types of incoming fields
+        for _k in ("inbound_time", "outbound_time", "collect_by_date", "entity_id", "spx_tracking_number", "spx_status", "storage_id"):
+            _v = data.get(_k)
+            if _v is not None and not isinstance(_v, (str, type(None))):
+                import logging
+                logging.getLogger("db_logger").warning("⛔ SPX field %r type=%s val=%r", _k, type(_v).__name__, str(_v)[:80])
+
+        existing = conn.execute(
+            "SELECT id, recipient_phone FROM spx_self_collection_orders WHERE spx_tracking_number = ?",
+            (_safe_str(data.get("spx_tracking_number", "")),),
+        ).fetchone()
+
+        phone = data.get("recipient_phone")
+        if phone:
+            phone = _normalize_phone(phone)
+
+        if existing:
+            # Update fields; preserve existing phone if blank in payload
+            phone_to_set = phone if phone else existing["recipient_phone"]
+            conn.execute(
+                """UPDATE spx_self_collection_orders
+                   SET entity_id=?, scan_tracking_number=?, recipient_name=?,
+                       recipient_phone=?, payment_method=?, transaction_method=?,
+                       transaction_amount=?, storage_id=?, inbound_time=?, outbound_time=?,
+                       collect_by_date=?, spx_status=?, updated_at=datetime('now')
+                   WHERE spx_tracking_number=?""",
+                (
+                    data.get("entity_id"),
+                    _safe_str(data.get("scan_tracking_number", "")) or None,
+                    _safe_str(data.get("recipient_name", "")) or None,
+                    phone_to_set,
+                    _safe_str(data.get("payment_method", "")),
+                    _safe_str(data.get("transaction_method", "")),
+                    _safe_str(data.get("transaction_amount", "")),
+                    _safe_str(data.get("storage_id", "")),
+                    _parse_sqlite_dt(data.get("inbound_time")),
+                    _parse_sqlite_dt(data.get("outbound_time")),
+                    _parse_sqlite_dt(data.get("collect_by_date")),
+                    _safe_str(data.get("spx_status", "ReadyForCollection")),
+                    _safe_str(data.get("spx_tracking_number", "")),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM spx_self_collection_orders WHERE spx_tracking_number = ?",
+                (_safe_str(data.get("spx_tracking_number", "")),),
+            ).fetchone()
+        else:
+            conn.execute(
+                """INSERT INTO spx_self_collection_orders
+                   (entity_id, spx_tracking_number, scan_tracking_number, recipient_name,
+                    recipient_phone, payment_method, transaction_method,
+                    transaction_amount, storage_id, inbound_time, outbound_time,
+                    collect_by_date, spx_status, hafjet_reminder_state, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    data.get("entity_id"),
+                    _safe_str(data.get("spx_tracking_number", "")),
+                    _safe_str(data.get("scan_tracking_number", "")) or None,
+                    _safe_str(data.get("recipient_name", "")) or None,
+                    phone,
+                    _safe_str(data.get("payment_method", "")),
+                    _safe_str(data.get("transaction_method", "")),
+                    _safe_str(data.get("transaction_amount", "")),
+                    _safe_str(data.get("storage_id", "")),
+                    _parse_sqlite_dt(data.get("inbound_time")),
+                    _parse_sqlite_dt(data.get("outbound_time")),
+                    _parse_sqlite_dt(data.get("collect_by_date")),
+                    _safe_str(data.get("spx_status", "ReadyForCollection")),
+                    data.get("hafjet_reminder_state", "Pending"),
+                    _safe_str(data.get("notes", "")),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM spx_self_collection_orders WHERE spx_tracking_number = ?",
+                (_safe_str(data.get("spx_tracking_number", "")),),
+            ).fetchone()
+        conn.commit()
+        return dict(row) if row else None
+    except Exception as e:
+        conn.rollback()
+        import traceback
+        log.error(f"❌ upsert_spx_order exception: {e}", exc_info=True)
+        raise e
+    finally:
+        conn.close()
+
+
+def create_spx_order(data: dict) -> dict:
+    """Alias for upsert_spx_order for backward compatibility."""
+    return upsert_spx_order(data)
+
+
+def import_spx_csv(csv_text: str) -> dict:
+    """Import SPX orders from CSV text. Returns {imported, updated, skipped, errors}."""
+    imported = 0
+    updated = 0
+    skipped = 0
+    errors = []
+
+    conn = _get_db()
+    for idx, row in enumerate(csv_text.splitlines()[1:], start=2):
+        cols = [c.strip() for c in row.split(",")]
+        if len(cols) < 11:
+            errors.append({"row": idx, "reason": "Not enough columns"})
+            skipped += 1
+            continue
+
+        try:
+            spx_id = cols[0]
+            scan_id = cols[1] or None
+            name = cols[2] or None
+            phone = _normalize_phone(cols[3])
+            payment = cols[4] or None
+            txn_method = cols[5] or None
+            txn_amount = cols[6] or None
+            storage = cols[7] or None
+            inbound = _parse_sqlite_dt(cols[8])
+            outbound = _parse_sqlite_dt(cols[9])
+            collect_by = _parse_sqlite_dt(cols[10])
+            status = cols[11].strip() if len(cols) > 11 else "Ready For Collection"
+            notes = cols[12].strip() if len(cols) > 12 else None
+
+            if not spx_id:
+                errors.append({"row": idx, "reason": "Missing SPX Tracking Number"})
+                skipped += 1
+                continue
+            if not collect_by:
+                errors.append({"row": idx, "reason": "Invalid Collect by Date"})
+                skipped += 1
+                continue
+            if status not in VALID_SPX_STATUSES:
+                errors.append({"row": idx, "reason": f"Invalid status: {status}"})
+                skipped += 1
+                continue
+
+            existing = conn.execute(
+                "SELECT id FROM spx_self_collection_orders WHERE spx_tracking_number = ?",
+                (spx_id,),
+            ).fetchone()
+
+            if existing:
+                conn.execute(
+                    """UPDATE spx_self_collection_orders
+                       SET scan_tracking_number=?, recipient_name=?, recipient_phone=?,
+                           payment_method=?, transaction_method=?, transaction_amount=?,
+                           storage_id=?, inbound_time=?, outbound_time=?,
+                           collect_by_date=?, spx_status=?, notes=?, updated_at=datetime('now')
+                       WHERE spx_tracking_number=?""",
+                    (
+                        scan_id, name, phone, payment, txn_method,
+                        txn_amount, storage, inbound, outbound,
+                        collect_by, status, notes, spx_id,
+                    ),
+                )
+                updated += 1
+            else:
+                conn.execute(
+                    """INSERT INTO spx_self_collection_orders
+                       (spx_tracking_number, scan_tracking_number, recipient_name,
+                        recipient_phone, payment_method, transaction_method,
+                        transaction_amount, storage_id, inbound_time, outbound_time,
+                        collect_by_date, spx_status, hafjet_reminder_state, notes)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        spx_id, scan_id, name, phone, payment, txn_method,
+                        txn_amount, storage, inbound, outbound,
+                        collect_by, status, "Pending", notes,
+                    ),
+                )
+                imported += 1
+        except Exception:
+            errors.append({"row": idx, "reason": "Unexpected error"})
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+    return {"imported": imported, "updated": updated, "skipped": skipped, "errors": errors[:100]}
+
+
+def bulk_map_phones(text: str) -> dict:
+    """Parse 'tracking_number phone' pairs (one per line).
+    Returns {"mapped": int, "skipped": int, "not_found": int, "errors": list}.
+    Idempotent — safe to run multiple times with same data.
+    """
+    mapped = skipped = not_found = 0
+    errors = []
+    conn = _get_db()
+    for idx, line in enumerate(text.strip().splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue  # skip empty / comment lines
+        parts = stripped.split()
+        if len(parts) < 2:
+            errors.append({"row": idx, "reason": f"Need at least tracking + phone, got {len(parts)} parts"})
+            skipped += 1
+            continue
+        tracking = parts[0].strip().upper()
+        phone_raw = parts[-1].strip()  # last token = phone
+        phone = _normalize_phone(phone_raw)
+        if not phone:
+            errors.append({"row": idx, "reason": f"Invalid phone: {phone_raw}"})
+            skipped += 1
+            continue
+        cur = conn.execute(
+            "SELECT id, recipient_phone FROM spx_self_collection_orders WHERE spx_tracking_number=?",
+            (tracking,),
+        ).fetchone()
+        if not cur:
+            errors.append({"row": idx, "reason": f"Tracking not found: {tracking}"})
+            not_found += 1
+            continue
+        # Update only if phone is new or different
+        if cur["recipient_phone"] != phone:
+            conn.execute(
+                "UPDATE spx_self_collection_orders SET recipient_phone=?, updated_at=datetime('now') WHERE id=?",
+                (phone, cur["id"]),
+            )
+        mapped += 1
+    conn.commit()
+    conn.close()
+    return {"mapped": mapped, "skipped": skipped, "not_found": not_found, "errors": errors[:100]}
+
+
+def save_spx_cookies(cookies_str: str):
+    conn = _get_db()
+    conn.execute(
+        "INSERT INTO spx_session (id, cookies, updated_at) VALUES (1, ?, datetime('now')) "
+        "ON CONFLICT(id) DO UPDATE SET cookies=excluded.cookies, updated_at=excluded.updated_at",
+        (cookies_str,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_spx_cookies() -> str | None:
+    conn = _get_db()
+    row = conn.execute("SELECT cookies FROM spx_session WHERE id=1").fetchone()
+    conn.close()
+    return row["cookies"] if row else None
+
+
+def get_orders_missing_phone(limit: int = 500, offset: int = 0) -> list:
+    conn = _get_db()
+    rows = conn.execute(
+        """SELECT * FROM spx_self_collection_orders
+           WHERE recipient_phone IS NULL OR recipient_phone = ''
+           ORDER BY collect_by_date ASC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_order_phone(order_id: int, phone_str: str):
+    phone = _normalize_phone(phone_str)
+    conn = _get_db()
+    conn.execute(
+        "UPDATE spx_self_collection_orders SET recipient_phone=?, updated_at=datetime('now') WHERE id=?",
+        (phone, order_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_spx_reminders_sent_today() -> int:
+    conn = _get_db()
+    row = conn.execute(
+        """SELECT COUNT(*) FROM messages
+           WHERE direction='outbound' AND routing_path='spx_reminder'
+             AND date(timestamp)=date('now')"""
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def _safe_str(value) -> str:
+    """Convert any value to string safely; returns empty string on None."""
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, bytes):
+            return value.decode().strip()
+        return str(value)
+    except Exception as e:
+        import logging
+        logging.getLogger("db_logger").error(f"🔥 _safe_str({type(value).__name__}) failed: {e}")
+        return str(value)
+
+
+def _parse_sqlite_dt(value):
+    """Parse datetime from string or datetime object to SQLite string format."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        import logging
+        logging.getLogger("hafjet-whatsapp.db").info("✅ _parse_sqlite_dt got datetime obj: %s", value.strftime("%Y-%m-%d %H:%M:%S"))
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+        return s
+    return None
+
+
+def get_spx_order_by_tracking(spx_tracking_number: str) -> dict:
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM spx_self_collection_orders WHERE spx_tracking_number = ?",
+        (spx_tracking_number,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def get_spx_due_orders(limit: int = 100, offset: int = 0) -> list:
+    """Return orders eligible for reminder processing."""
+    conn = _get_db()
+    rows = conn.execute(
+        """SELECT * FROM spx_self_collection_orders
+           WHERE hafjet_reminder_state NOT IN ('Completed', 'CollectionFailed')
+             AND is_paused = 0
+             AND recipient_phone IS NOT NULL
+             AND recipient_phone != ''
+           ORDER BY collect_by_date ASC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_all_spx_orders(limit: int = 1000, offset: int = 0) -> list:
+    """Return ALL SPX orders — no phone/status filter, for dashboard listing."""
+    conn = _get_db()
+    rows = conn.execute(
+        "SELECT * FROM spx_self_collection_orders ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_spx_reminder_state(order_id: int, state: str, last_sent_at: str = None) -> dict:
+    conn = _get_db()
+    conn.execute(
+        """UPDATE spx_self_collection_orders
+           SET hafjet_reminder_state = ?, last_reminder_sent_at = ?, updated_at = datetime('now')
+           WHERE id = ?""",
+        (state, last_sent_at, order_id),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM spx_self_collection_orders WHERE id = ?", (order_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def get_spx_stats() -> dict:
+    conn = _get_db()
+    rows = conn.execute(
+        """SELECT spx_status, hafjet_reminder_state, COUNT(*) as cnt
+           FROM spx_self_collection_orders
+           GROUP BY spx_status, hafjet_reminder_state"""
+    ).fetchall()
+    conn.close()
+    total = 0
+    by_status = {}
+    for r in rows:
+        key = f"{r['spx_status']}|{r['hafjet_reminder_state']}"
+        cnt = r["cnt"] or 0
+        total += cnt
+        by_status[key] = cnt
+    return {"total": total, "by_status": by_status, "rows": [dict(r) for r in rows]}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1327,7 +1850,7 @@ def set_escalation_notified(phone: str) -> None:
 
 def get_inbox_conversations(filter_type: str = "all", staff_id: Optional[int] = None) -> list:
     conn = _get_db()
-    base_query = """
+    base_query = """\
         SELECT c.phone, c.name, c.last_contact, c.total_messages, c.tags, c.note,
                c.assigned_to, c.status, c.bot_paused, c.escalated_at, c.resolved_at,
                s.name as agent_name, s.status as agent_status
@@ -1348,3 +1871,65 @@ def get_inbox_conversations(filter_type: str = "all", staff_id: Optional[int] = 
     conn.close()
     keys = ["phone", "name", "last_contact", "total_messages", "tags", "note", "assigned_to", "status", "bot_paused", "escalated_at", "resolved_at", "agent_name", "agent_status"]
     return [dict(zip(keys, r)) for r in rows]
+
+
+# ── SPX Sync Progress (DB-backed, survives restarts) ──────────────
+
+SYNC_PROGRESS_DEFAULTS = {
+    "running": False,
+    "phase": "idle",
+    "started_at": None,
+    "completed_at": None,
+    "last_progress_at": None,
+    "current_page": 0,
+    "total_pages": 0,
+    "total_orders": 0,
+    "synced": 0,
+    "phones_fetched": 0,
+    "total_missing_phones": 0,
+    "phone_fetch_offset": 0,
+    "errors": [],
+    "last_error": None,
+}
+
+
+def load_sync_progress() -> dict:
+    """Load sync progress from DB (persistent across restarts).
+    Falls back to defaults if no saved state exists."""
+    try:
+        conn = _get_db()
+        row = conn.execute("SELECT state_json FROM spx_sync_state WHERE id=1").fetchone()
+        conn.close()
+        if row:
+            data = json.loads(row["state_json"])
+            # Merge with defaults to handle missing keys
+            merged = dict(SYNC_PROGRESS_DEFAULTS)
+            merged.update(data)
+            return merged
+    except Exception as e:
+        log.warning("[DB] load_sync_progress failed: %s, using defaults", e)
+    return dict(SYNC_PROGRESS_DEFAULTS)
+
+
+def save_sync_progress(data: dict) -> None:
+    """Save sync progress to DB.
+    Converts non-serialisable types (datetime, etc.) to strings."""
+    try:
+        cleaned = {}
+        for k, v in data.items():
+            if isinstance(v, (str, int, float, bool, list, dict)):
+                cleaned[k] = v
+            elif v is None:
+                cleaned[k] = None
+            else:
+                cleaned[k] = str(v)
+        conn = _get_db()
+        conn.execute(
+            "INSERT INTO spx_sync_state (id, state_json, updated_at) VALUES (1, ?, datetime('now')) "
+            "ON CONFLICT(id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
+            (json.dumps(cleaned, default=str),),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("[DB] save_sync_progress failed: %s", e)

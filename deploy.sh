@@ -13,6 +13,9 @@ EXCLUDE_PATTERNS = [
     '.backup', 'app_settings_*.json',
     'azure-settings-backup*', '*.zip', 'startup_debug.log',
     'deploy*.sh',
+    '*.db', 'logs', '*.bak*', '*.backup', 'test_*.py', '*_test.py',
+    'build_zip.py', 'fix_*.py', 'update_fallback.py',
+    'apply_all_patches.py', '*.md',
 ]
 
 def should_exclude_dir(dirpath, dirname):
