@@ -65,7 +65,37 @@ PERATURAN TAMBAHAN:
 - Jangan sebut promosi tetap kerana tiada promosi tetap buat masa ini melainkan staff telah sahkan.
 """
 
-def ask_openrouter(user_message: str, wa_name: Optional[str] = None) -> Optional[str]:
+# ── AI Memory: pull last N messages for a phone from db_logger ──────────
+def build_memory_context(phone: Optional[str], limit: int = 8) -> str:
+    """Return recent conversation history for personalization (AI Memory step)."""
+    if not phone:
+        return ""
+    try:
+        from db_logger import _query_customer
+        rows = _query_customer(phone, limit)
+        if not rows:
+            return ""
+        lines = []
+        for r in rows:
+            direction = "Pelanggan" if r.get("direction") == "inbound" else "Bot"
+            content = (r.get("content") or "").strip().replace("\n", " ")
+            if content:
+                lines.append(f"{direction}: {content}")
+        if lines:
+            return "\n".join(lines[-limit:])
+    except Exception as e:
+        print(f"[hermes_ai] memory build failed: {e}")
+    return ""
+
+POWER_QUESTION = (
+    "Nak saya bantu yang mana satu ni? 👇\n"
+    "1️⃣ Repair phone\n"
+    "2️⃣ Beli phone (cash / ansuran)\n"
+    "3️⃣ Semak status parcel SPX / job repair\n"
+    "4️⃣ Tanya pasal ansuran"
+)
+
+def ask_openrouter(user_message: str, wa_name: Optional[str] = None, phone: Optional[str] = None) -> Optional[str]:
     start_time = time.time()
     print(f"[hermes_ai] [OPENROUTER] Request started at {start_time}")
     
@@ -87,9 +117,25 @@ def ask_openrouter(user_message: str, wa_name: Optional[str] = None) -> Optional
         print(f"[hermes_ai] [OPENROUTER] Base URL: {OPENROUTER_URL}")
     
     customer_name_hint = wa_name.strip() if wa_name else "pelanggan"
+
+    # ── AI Memory: recent history for personalization ──
+    memory_ctx = build_memory_context(phone)
+    memory_block = f"\n\n[HISTORY PERBUALAN LEPASTU]\n{memory_ctx}\n[/HISTORY]" if memory_ctx else ""
+
+    # ── Power Question hanya untuk cold lead (tiada history) ──
+    power_block = ""
+    if not memory_ctx:
+        power_block = f"\n\n[SUGGESTION PENUTUP] Akhiri mesej dengan Power Question ni:\n{POWER_QUESTION}"
+
+    user_content = (
+        f"Nama pelanggan: {customer_name_hint}\n"
+        f"Nombor: {phone or 'tidak diketahui'}\n"
+        f"Mesej pelanggan: {user_message}"
+        f"{memory_block}{power_block}"
+    )
     messages = [
         {"role": "system", "content": SOUL_CONTEXT},
-        {"role": "user", "content": f"Nama pelanggan: {customer_name_hint}\\nMesej pelanggan: {user_message}"}
+        {"role": "user", "content": user_content}
     ]
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -188,12 +234,12 @@ def ask_hermes_cli(user_message: str) -> Optional[str]:
         traceback.print_exc()
         return None
 
-def ask_hermes(user_message: str, wa_name: Optional[str] = None) -> Optional[str]:
+def ask_hermes(user_message: str, wa_name: Optional[str] = None, phone: Optional[str] = None) -> Optional[str]:
     start_time = time.time()
     print(f"[hermes_ai] [ASK_HERMES] Request started at {start_time}")
     
     # Try OpenRouter first
-    reply = ask_openrouter(user_message, wa_name=wa_name)
+    reply = ask_openrouter(user_message, wa_name=wa_name, phone=phone)
     if reply and reply.strip():
         print(f"[hermes_ai] [ASK_HERMES] OpenRouter succeeded")
         end_time = time.time()

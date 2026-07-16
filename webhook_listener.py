@@ -1420,7 +1420,7 @@ async def generate_reply(message: str, sender_name: str, sender_number: str) -> 
     loop = asyncio.get_event_loop()
     try:
         ai_reply = await asyncio.wait_for(
-            loop.run_in_executor(None, ask_hermes, message, sender_name),
+            loop.run_in_executor(None, ask_hermes, message, sender_name, sender_number),
             timeout=75,
         )
     except asyncio.TimeoutError:
