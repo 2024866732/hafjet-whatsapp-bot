@@ -29,7 +29,7 @@ export async function fetchStats(date = "") {
 export async function resolveCustomer(phone) {
   const res = await fetch(`${API_BASE}/api/customers/${encodeURIComponent(phone)}/resolve`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to resolve');
   return res.json();
@@ -38,7 +38,7 @@ export async function resolveCustomer(phone) {
 export async function escalateCustomer(phone) {
   const res = await fetch(`${API_BASE}/api/customers/${encodeURIComponent(phone)}/escalate`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to escalate');
   return res.json();
@@ -329,7 +329,7 @@ export async function staffLogin(email, password) {
 
 export async function fetchStaffMe() {
   const res = await fetch(`${API_BASE}/api/auth/me`, {
-    headers: { 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to fetch staff me');
   return res.json();
@@ -337,7 +337,7 @@ export async function fetchStaffMe() {
 
 export async function fetchStaffList() {
   const res = await fetch(`${API_BASE}/api/staff`, {
-    headers: { 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to fetch staff');
   return res.json();
@@ -346,7 +346,7 @@ export async function fetchStaffList() {
 export async function createStaff(data) {
   const res = await fetch(`${API_BASE}/api/staff`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
     body: JSON.stringify(data),
   });
   const result = await res.json();
@@ -358,7 +358,7 @@ export async function createStaff(data) {
 
 export async function fetchInbox(filterType = 'all') {
   const res = await fetch(`${API_BASE}/api/inbox?filter=${encodeURIComponent(filterType)}`, {
-    headers: { 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
   });
   if (!res.ok) throw new Error('Failed to fetch inbox');
   return res.json();
@@ -367,7 +367,7 @@ export async function fetchInbox(filterType = 'all') {
 export async function assignConversation(phone, staffId) {
   const res = await fetch(`${API_BASE}/api/conversations/${encodeURIComponent(phone)}/assign`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
     body: JSON.stringify({ staff_id: staffId }),
   });
   const result = await res.json();
@@ -378,7 +378,7 @@ export async function assignConversation(phone, staffId) {
 export async function updateConversationStatus(phone, status) {
   const res = await fetch(`${API_BASE}/api/conversations/${encodeURIComponent(phone)}/status`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key': import.meta.env.VITE_API_KEY || '' },
+    headers: getAuthHeaders(),
     body: JSON.stringify({ status }),
   });
   const result = await res.json();

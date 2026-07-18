@@ -8,6 +8,18 @@ exclude_patterns = [
     ".backup", "hermes_ai.py.backup", "hermes_ai_new.py",
     "update_fallback.py", "fix_fallback.py",
     ".db",  # exclude all database files (bot_data.db, etc.)
+    # ── Pre-deploy artifact hygiene (patch 2026-07-16) ──
+    ".tar.gz",                      # db / file backups
+    "backup",                       # *backup* (db-backup, azure-settings-backup, etc.)
+    "AGENTS.md",                    # auto-generated context doc
+    "DEPLOYMENT",                   # DEPLOYMENT*.md / DEPLOYMENT_NOTES.md
+    "oracle-",                      # oracle-deployment-plan-*.md
+    ".user.js",                     # spx_phone_agent*.user.js
+    "business_info.txt",            # untracked loose copy (loaded at runtime from disk anyway)
+    "check_", "upload_", "debug_", "verify_", "monitor_", "fix_",  # temp/debug scripts
+    "intent_rules.json", "media_map.json",
+    "start_local.sh", "apply_all_patches.py", "run_fetch_phones.py", "s2f5_test.py",
+    "azure-settings-backup",        # azure-settings-backup-*.json
 ]
 
 def should_exclude(name):

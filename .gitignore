@@ -51,11 +51,15 @@ DEPLOYMENT_NOTES.md
 *.user.js
 azure-settings-backup-*.json
 
-# Database backups
+# Database backups (tar.gz dumps etc)
 prod_*.db
 verify_*.db
 test_*.db
 monitor_*.db
+*.tar.gz
+db-backup*
+.bak
+.backup
 
 # Logs
 logs/
